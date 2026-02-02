@@ -63,17 +63,6 @@ example_videos/
 - **total_mask.mp4**: Binary mask video showing the object AND its effects (shadows, reflections, etc.)
 
 You can generate masks using [SAM2](https://github.com/facebookresearch/segment-anything-2).
-
-### Generating total_mask from object_mask
-
-If you only have the object_mask, you can automatically generate total_mask using self-attention:
-
-```bash
-python self_attention_map.py --video_folder ./example_videos/your_video_name
-```
-
-This uses the diffusion model's self-attention to find regions that are related to the object (like shadows and reflections).
-
 ---
 
 ## Object Removal
@@ -115,6 +104,17 @@ Results are saved to the `results/` directory:
 results/
 ├── video_name.mp4
 ```
+
+### Generating total_mask from object_mask
+
+If you only have the object_mask, you can automatically generate total_mask using self-attention:
+
+```bash
+python self_attention_map.py --video_folder ./example_videos/your_video_name
+```
+
+This uses the diffusion model's self-attention to find regions that are related to the object (like shadows and reflections).
+
 
 ### Important Note on Attention Guidance
 
