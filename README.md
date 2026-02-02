@@ -63,6 +63,7 @@ example_videos/
 - **total_mask.mp4**: Binary mask video showing the object AND its effects (shadows, reflections, etc.)
 
 You can generate masks using [SAM2](https://github.com/facebookresearch/segment-anything-2).
+
 ---
 
 ## Object Removal
