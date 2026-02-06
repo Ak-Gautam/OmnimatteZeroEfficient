@@ -18,7 +18,7 @@ OmnimatteZero is a training-free approach for video matting, object removal, and
 ### Requirements
 
 - Python 3.8+
-- CUDA-capable GPU (16GB+ VRAM recommended)
+- CUDA-capable GPU (32GB+ VRAM recommended)
 - PyTorch 2.4+
 
 ### Setup
