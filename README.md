@@ -1,5 +1,6 @@
 # OmnimatteZero
 
+[![Project Page](https://img.shields.io/badge/Project%20Page-website-blue)](https://dvirsamuel.github.io/omnimattezero.github.io/)
 [![Paper](https://img.shields.io/badge/arXiv-2503.18033-b31b1b.svg)](https://arxiv.org/abs/2503.18033)
 
 Official implementation of **OmnimatteZero: Training-Free Video Matting and Compositing via Latent Diffusion Models**
