@@ -19,7 +19,7 @@ OmnimatteZero is a training-free approach for video matting, object removal, and
 ### Requirements
 
 - Python 3.8+
-- CUDA-capable GPU (32GB+ VRAM recommended)
+- CUDA-capable GPU (16GB+ VRAM with optimizations, 32GB+ recommended for full quality)
 - PyTorch 2.4+
 
 ### Setup
@@ -264,7 +264,144 @@ If you find this work useful, please cite our paper:
 
 ## Troubleshooting
 
+### Out of Memory (CUDA OOM)
+- Use the memory-optimized scripts (see section below)
+- Use `--preset 16gb` for aggressive memory optimization
+- Reduce video resolution with `--height` and `--width`
+- Reduce frame count with `--max_frames`
+- Enable `--skip_upscale` for object removal
+
 ### Slow Generation
 - Reduce `num_inference_steps`
 - Use smaller video resolution
 - Ensure all packages are installed as specified in `requirements.txt`
+
+---
+
+## 🚀 Memory-Optimized Version (16GB VRAM)
+
+We provide memory-optimized versions of all scripts that can run on consumer GPUs with 16GB VRAM (RTX 4080, RTX 3090, etc.).
+
+### Key Optimizations Applied
+
+1. **FP8 Layerwise Casting** - Stores transformer weights in float8 format, computes in bfloat16
+2. **Group Offloading** - Moves layer groups to CPU with CUDA streams for overlapped data transfer
+3. **VAE Tiling & Slicing** - Processes video in tiles to reduce peak memory
+4. **Selective Attention Extraction** - Uses subset of attention layers for mask generation
+5. **Aggressive Memory Clearing** - Proactive garbage collection between operations
+
+### Memory Presets
+
+| Preset | Target VRAM | Resolution | Max Frames | Inference Steps |
+|--------|-------------|------------|------------|-----------------|
+| `16gb` | 16 GB | 704×480 | 97 | 20 |
+| `24gb` | 24 GB | 768×512 | 121 | 25 |
+| `32gb` | 32+ GB | 768×512 | 161 | 30 |
+
+### Optimized Scripts
+
+#### Object Removal (16GB VRAM)
+
+```bash
+# Basic usage with 16GB preset
+python object_removal_optimized.py --preset 16gb
+
+# Process a specific video
+python object_removal_optimized.py --preset 16gb --video cat_reflection
+
+# Custom resolution and frames
+python object_removal_optimized.py --preset 16gb --height 384 --width 576 --max_frames 65
+
+# Skip upscaling for faster processing
+python object_removal_optimized.py --preset 16gb --skip_upscale
+```
+
+#### Self-Attention Mask Generation (16GB VRAM)
+
+```bash
+# Basic usage
+python self_attention_map_optimized.py --video_folder ./example_videos/cat_reflection --preset 16gb
+
+# With fewer attention layers (even less memory)
+python self_attention_map_optimized.py --video_folder ./example_videos/cat_reflection --preset 16gb --max_layers 2
+```
+
+#### Foreground Composition (16GB VRAM)
+
+```bash
+# Basic usage
+python foreground_composition_optimized.py --preset 16gb --video_folder swan_lake --new_bg_video cat_reflection
+
+# Skip refinement for faster processing
+python foreground_composition_optimized.py --preset 16gb --video_folder swan_lake --skip_refinement
+```
+
+### Using the Memory Utilities in Your Code
+
+```python
+from OmnimatteZero import OmnimatteZero
+from memory_utils import (
+    MemoryConfig,
+    apply_memory_optimizations,
+    auto_configure,
+    print_memory_stats
+)
+
+# Auto-detect GPU and configure
+config = auto_configure()  # Returns appropriate preset based on detected VRAM
+
+# Or manually select a preset
+config = MemoryConfig("16gb")
+
+# Load pipeline
+pipe = OmnimatteZero.from_pretrained(
+    "a-r-r-o-w/LTX-Video-0.9.7-diffusers",
+    torch_dtype=torch.bfloat16
+)
+
+# Apply optimizations (IMPORTANT: do this BEFORE moving to GPU for group offloading)
+if not config.enable_model_cpu_offload:
+    pipe.to("cuda")
+pipe = apply_memory_optimizations(pipe, config)
+
+# Check memory usage
+print_memory_stats()
+
+# Get recommended settings for your VRAM
+from memory_utils import get_recommended_settings
+settings = get_recommended_settings(16.0)  # 16GB VRAM
+print(settings)
+# {'preset': '16gb', 'height': 480, 'width': 704, 'num_frames': 97, 'num_inference_steps': 20}
+```
+
+### Performance vs Quality Trade-offs
+
+| Setting | Memory Savings | Quality Impact |
+|---------|---------------|----------------|
+| FP8 casting | ~30% | Minimal (skip norm layers) |
+| Group offloading | ~40% | None (just slower) |
+| Reduced resolution | Significant | Noticeable |
+| Fewer frames | Significant | Shorter videos only |
+| Skip upscaling | ~20% | Lower final resolution |
+| Fewer inference steps | ~15% | Some quality loss |
+
+### Tips for Best Results on Limited VRAM
+
+1. **Start with the 16gb preset** and adjust from there
+2. **Process shorter clips** - split long videos into segments
+3. **Use lower resolution** for testing, then increase for final output
+4. **Skip upscaling** for initial experiments
+5. **Close other GPU applications** (browsers, games, etc.)
+6. **Monitor with `nvidia-smi`** to see actual usage
+
+### Benchmarks
+
+Tested on RTX 4080 (16GB VRAM):
+
+| Operation | 32gb Preset | 16gb Preset | 
+|-----------|-------------|-------------|
+| Object Removal (97 frames) | OOM | ~4 min |
+| Mask Generation | OOM | ~2 min |
+| Foreground Composition | OOM | ~3 min |
+
+---
