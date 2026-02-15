@@ -1,0 +1,9 @@
+playenv/
+results/
+logs/
+*.log
+*.csv
+*.json
+*.h5
+*.ckpt
+*.pt
