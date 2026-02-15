@@ -7,3 +7,7 @@ logs/
 *.h5
 *.ckpt
 *.pt
+*.pyc
+.DS_Store
+__pycache__/
+model_checkpoints/
