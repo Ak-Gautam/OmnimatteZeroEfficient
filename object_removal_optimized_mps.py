@@ -12,7 +12,7 @@ import os
 import argparse
 from tqdm import tqdm
 import torch
-from diffusers import LTXLatentUpsamplePipeline
+from diffusers import LTXVideoTransformer3DModel
 from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
 from diffusers.utils import export_to_video, load_video
 from transformers import AutoTokenizer, T5EncoderModel
@@ -48,8 +48,6 @@ def parse_args():
                        help="Maximum frames to process (auto-selected based on preset if not specified)")
     parser.add_argument("--num_inference_steps", type=int, default=None,
                        help="Number of inference steps (fewer = faster but lower quality)")
-    parser.add_argument("--skip_upscale", action="store_true",
-                       help="Skip latent upscaling (faster, smaller output)")
     parser.add_argument("--cache_dir", type=str, default=None,
                        help="Directory for model cache")
     return parser.parse_args()
@@ -107,9 +105,17 @@ def load_pipeline(config: MemoryConfig, cache_dir: str = None):
     """Load and optimize the OmnimatteZero pipeline."""
     print("\n=== Loading Pipeline ===")
     
+    # Load 2B Transformer
+    transformer = LTXVideoTransformer3DModel.from_single_file(
+        "https://huggingface.co/Lightricks/LTX-Video/blob/main/ltxv-2b-0.9.8-distilled.safetensors",
+        torch_dtype=torch.float16,
+        cache_dir=cache_dir
+    )
+    
     # Load with float16 for memory efficiency and skip text encoder
     pipe = OmnimatteZero.from_pretrained(
         "a-r-r-o-w/LTX-Video-0.9.7-diffusers",
+        transformer=transformer,
         text_encoder=None,
         tokenizer=None,
         torch_dtype=torch.float16,
@@ -127,24 +133,6 @@ def load_pipeline(config: MemoryConfig, cache_dir: str = None):
     return pipe
 
 
-def load_upscaler(config: MemoryConfig, vae, cache_dir: str = None):
-    """Load and optimize the latent upscaler pipeline."""
-    print("\n=== Loading Upscaler ===")
-    
-    pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
-        "a-r-r-o-w/LTX-Video-0.9.7-Latent-Spatial-Upsampler-diffusers",
-        vae=vae,
-        torch_dtype=torch.float16,
-        cache_dir=cache_dir
-    )
-    
-    # Always use model CPU offload for upscaler to save memory
-    pipe_upsample.enable_model_cpu_offload()
-    
-    print_memory_stats()
-    return pipe_upsample
-
-
 def process_video(
     pipe,
     video_path: str,
@@ -158,8 +146,7 @@ def process_video(
     prompt_embeds,
     prompt_attention_mask,
     negative_prompt_embeds,
-    negative_prompt_attention_mask,
-    pipe_upsample=None
+    negative_prompt_attention_mask
 ):
     """Process a single video for object removal."""
     
@@ -212,16 +199,6 @@ def process_video(
         )
         video_output = output.frames[0]
     
-    # Optional upscaling
-    if pipe_upsample is not None:
-        print("  Upscaling...")
-        clear_memory()
-        with MemoryTracker("Upscaling"):
-            video_output = pipe_upsample(
-                video=video_output,
-                output_type="pil"
-            ).frames[0]
-    
     # Export
     export_to_video(video_output, output_path, fps=24)
     print(f"  Saved to: {output_path}")
@@ -259,7 +236,6 @@ def main():
     print(f"  Resolution: {width}x{height}")
     print(f"  Max frames: {max_frames}")
     print(f"  Inference steps: {num_inference_steps}")
-    print(f"  Upscaling: {'No' if args.skip_upscale else 'Yes'}")
     
     prompt = "Empty"
     negative_prompt = "worst quality, inconsistent motion, blurry, jittery, distorted"
@@ -267,15 +243,6 @@ def main():
     
     # Load pipeline
     pipe = load_pipeline(config, args.cache_dir)
-    
-    # Load upscaler if needed
-    pipe_upsample = None
-    if not args.skip_upscale:
-        try:
-            pipe_upsample = load_upscaler(config, pipe.vae, args.cache_dir)
-        except Exception as e:
-            print(f"Warning: Could not load upscaler: {e}")
-            print("Continuing without upscaling...")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -322,8 +289,7 @@ def main():
             prompt_embeds=pe,
             prompt_attention_mask=pam,
             negative_prompt_embeds=ne,
-            negative_prompt_attention_mask=nam,
-            pipe_upsample=pipe_upsample
+            negative_prompt_attention_mask=nam
         )
         
         if not success:
