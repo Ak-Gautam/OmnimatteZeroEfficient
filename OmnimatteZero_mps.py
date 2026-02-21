@@ -55,7 +55,7 @@ class OmnimatteZero(LTXConditionPipeline):
 
         if len(conditions) > 0:
             condition_latent_frames_mask = torch.zeros(
-                (batch_size, num_latent_frames), device=device, dtype=torch.float32
+                (batch_size, num_latent_frames), device=device, dtype=torch.float16
             )
 
             extra_conditioning_latents = []
@@ -300,7 +300,7 @@ class OmnimatteZero(LTXConditionPipeline):
             latents=latents,
             generator=generator,
             device=device,
-            dtype=torch.float32,
+            dtype=torch.float16,
         )
 
         video_coords = video_coords.float()
