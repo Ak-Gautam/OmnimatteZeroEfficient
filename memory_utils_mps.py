@@ -77,15 +77,7 @@ class MemoryConfig:
 def get_optimal_dtype():
     """Get the optimal dtype for the current GPU."""
     if torch.backends.mps.is_available():
-        capability = torch.cuda.get_device_capability()
-        # SM 8.9+ (Ada Lovelace, Hopper) supports fp8 natively
-        if capability[0] >= 8 and capability[1] >= 9:
-            return torch.float16, torch.float16
-        # SM 8.0+ (Ampere) supports bf16
-        elif capability[0] >= 8:
-            return torch.float16, torch.float16
-        else:
-            return torch.float16, torch.float16
+        return torch.float16, torch.float16
     return torch.float32, torch.float32
 
 

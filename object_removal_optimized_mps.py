@@ -119,7 +119,7 @@ def load_pipeline(config: MemoryConfig, cache_dir: str = None):
     # Apply memory optimizations BEFORE moving to GPU
     # This is crucial for group offloading to work properly
     if not config.enable_model_cpu_offload:
-        pipe.to("cuda")
+        pipe.to("mps")
     
     pipe = apply_memory_optimizations(pipe, config)
     
