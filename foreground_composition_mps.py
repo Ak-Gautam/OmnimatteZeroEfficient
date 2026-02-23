@@ -1,8 +1,7 @@
 """
 Foreground composition for OmnimatteZero — Apple Silicon (MPS) version.
-
+Uses the 2B distilled model (ltxv-2b-0.9.8-distilled) for efficient inference.
 Extracts the foreground layer (object + effects) and composes onto new background.
-Uses text encoder decoupling for memory efficiency.
 
 Usage:
     python foreground_composition_mps.py --video_folder swan_lake --new_bg results/cat_reflection.mp4
@@ -12,8 +11,9 @@ from typing import Optional, Union
 import torch
 import argparse
 import os
-from diffusers import AutoencoderKLLTXVideo
+from diffusers import AutoencoderKLLTXVideo, LTXVideoTransformer3DModel
 from diffusers.pipelines.ltx.pipeline_ltx_condition import retrieve_latents
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import export_to_video, load_video
 from PIL import Image
 from transformers import AutoTokenizer, T5EncoderModel
@@ -26,7 +26,10 @@ from memory_utils_mps import (
     print_memory_stats,
 )
 
-MODEL_ID = "a-r-r-o-w/LTX-Video-0.9.7-diffusers"
+# Model configuration — same as object_removal_optimized_mps.py
+CHECKPOINT_REPO = "Lightricks/LTX-Video"
+TRANSFORMER_FILE = "ltxv-2b-0.9.8-distilled.safetensors"
+DIFFUSERS_REPO = "a-r-r-o-w/LTX-Video-0.9.7-diffusers"
 
 
 def tensor_video_to_pil_images(video_tensor):
@@ -77,9 +80,9 @@ class MyAutoencoderKLLTXVideo(AutoencoderKLLTXVideo):
 def precompute_text_embeddings(prompt, negative_prompt, cache_dir=None):
     """Load text encoder, encode, delete."""
     print("\n=== Precomputing Text Embeddings ===")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer", cache_dir=cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(DIFFUSERS_REPO, subfolder="tokenizer", cache_dir=cache_dir)
     text_encoder = T5EncoderModel.from_pretrained(
-        MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16, cache_dir=cache_dir)
+        DIFFUSERS_REPO, subfolder="text_encoder", torch_dtype=torch.float16, cache_dir=cache_dir)
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     text_encoder.to(device)
 
@@ -100,8 +103,37 @@ def precompute_text_embeddings(prompt, negative_prompt, cache_dir=None):
     return pe, pm, ne, nm
 
 
+def load_pipeline(config: MemoryConfig, cache_dir=None, use_custom_vae=True):
+    """Load pipeline with 2B distilled transformer."""
+    print("\n=== Loading Pipeline (2B distilled) ===")
+
+    transformer = LTXVideoTransformer3DModel.from_single_file(
+        f"https://huggingface.co/{CHECKPOINT_REPO}/blob/main/{TRANSFORMER_FILE}",
+        torch_dtype=torch.float16, cache_dir=cache_dir,
+    )
+
+    if use_custom_vae:
+        vae = MyAutoencoderKLLTXVideo.from_pretrained(
+            DIFFUSERS_REPO, subfolder="vae", torch_dtype=torch.float16, cache_dir=cache_dir)
+    else:
+        vae = AutoencoderKLLTXVideo.from_pretrained(
+            DIFFUSERS_REPO, subfolder="vae", torch_dtype=torch.float16, cache_dir=cache_dir)
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        DIFFUSERS_REPO, subfolder="scheduler", cache_dir=cache_dir)
+
+    pipe = OmnimatteZero(
+        transformer=transformer, vae=vae, scheduler=scheduler,
+        text_encoder=None, tokenizer=None)
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    pipe.to(device)
+    pipe = apply_memory_optimizations(pipe, config)
+    return pipe
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Foreground composition (MPS)")
+    parser = argparse.ArgumentParser(description="Foreground composition (MPS, 2B distilled)")
     parser.add_argument("--video_folder", type=str, required=True)
     parser.add_argument("--new_bg", type=str, required=True,
                         help="Path to new background video")
@@ -124,15 +156,8 @@ def main():
         negative_prompt = "worst quality, inconsistent motion, blurry, jittery, distorted"
         pe, pm, ne, nm = precompute_text_embeddings(prompt, negative_prompt, args.cache_dir)
 
-    # Step 2: Load pipeline
-    print("\nLoading pipeline...")
-    pipe = OmnimatteZero.from_pretrained(
-        MODEL_ID, text_encoder=None, tokenizer=None,
-        torch_dtype=torch.float16, cache_dir=args.cache_dir)
-    pipe.vae = MyAutoencoderKLLTXVideo.from_pretrained(
-        MODEL_ID, subfolder="vae", torch_dtype=torch.float16, cache_dir=args.cache_dir)
-    pipe.to(device)
-    pipe = apply_memory_optimizations(pipe, config)
+    # Step 2: Load pipeline with 2B distilled transformer + custom VAE
+    pipe = load_pipeline(config, args.cache_dir, use_custom_vae=True)
 
     # Step 3: Load videos
     folder = args.video_folder
@@ -210,7 +235,7 @@ def main():
                 height=expected_height,
                 num_frames=num_frames,
                 denoise_strength=0.3,
-                num_inference_steps=10,
+                num_inference_steps=8,
                 latents=condition_latents,
                 decode_timestep=0.05,
                 image_cond_noise_scale=0.025,

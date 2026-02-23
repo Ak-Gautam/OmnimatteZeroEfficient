@@ -1,8 +1,7 @@
 """
 Self-attention map extraction for OmnimatteZero — Apple Silicon (MPS) version.
+Uses the 2B distilled model (ltxv-2b-0.9.8-distilled) for efficient inference.
 Generates total_mask.mp4 from video + object_mask by finding attention-based effects.
-
-Uses the same text encoder decoupling strategy as object_removal_optimized_mps.py.
 
 Usage:
     python self_attention_map_mps.py --video_folder ./example_videos/cat_reflection
@@ -14,7 +13,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from contextlib import contextmanager
+from diffusers import LTXVideoTransformer3DModel, AutoencoderKLLTXVideo
 from diffusers.pipelines.ltx.pipeline_ltx_condition import retrieve_latents
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import export_to_video, load_video
 from PIL import Image
 import numpy as np
@@ -30,7 +31,10 @@ from memory_utils_mps import (
     MemoryTracker,
 )
 
-MODEL_ID = "a-r-r-o-w/LTX-Video-0.9.7-diffusers"
+# Model configuration — same as object_removal_optimized_mps.py
+CHECKPOINT_REPO = "Lightricks/LTX-Video"
+TRANSFORMER_FILE = "ltxv-2b-0.9.8-distilled.safetensors"
+DIFFUSERS_REPO = "a-r-r-o-w/LTX-Video-0.9.7-diffusers"
 
 
 def fix_num_frames_for_vae(num_frames: int, temporal_compression_ratio: int = 8) -> int:
@@ -218,9 +222,7 @@ class SelfAttentionMapExtraction:
         noisy_latents = (1 - sigma) * latents + sigma * noise
         timestep = torch.tensor([self.extraction_timestep * 1000], device=device)
 
-        # Use provided prompt embeddings (already precomputed)
         if prompt_embeds is None:
-            # Fallback: encode on-device if text encoder is available
             prompt_embeds_local, prompt_mask_local, _, _ = self.pipeline.encode_prompt(
                 prompt="", negative_prompt=None, do_classifier_free_guidance=False,
                 num_videos_per_prompt=1, device=device)
@@ -265,7 +267,7 @@ class SelfAttentionMapExtraction:
         return latents
 
     @torch.no_grad()
-    def extract_effects_mask(self, video, object_mask, height: int = 512, width: int = 768,
+    def extract_effects_mask(self, video, object_mask, height: int = 480, width: int = 704,
                              prompt_embeds=None, prompt_attention_mask=None,
                              threshold: Optional[float] = None, dilation_size: int = 3,
                              generator: Optional[torch.Generator] = None) -> torch.Tensor:
@@ -365,7 +367,7 @@ class SelfAttentionMapExtraction:
     @torch.no_grad()
     def generate_total_mask(self, video_path: str, object_mask_path: str, output_path: str,
                             prompt_embeds=None, prompt_attention_mask=None,
-                            height: int = 512, width: int = 768,
+                            height: int = 480, width: int = 704,
                             threshold: Optional[float] = None, dilation_size: int = 3,
                             fps: int = 24) -> torch.Tensor:
         device = self.pipeline._execution_device
@@ -420,7 +422,7 @@ class SelfAttentionMapExtraction:
 def generate_total_mask_for_folder(pipeline, folder_path: str,
                                    prompt_embeds=None, prompt_attention_mask=None,
                                    output_folder: Optional[str] = None,
-                                   height: int = 384, width: int = 576,
+                                   height: int = 480, width: int = 704,
                                    threshold: Optional[float] = None, dilation_size: int = 3):
     if output_folder is None:
         output_folder = folder_path
@@ -454,9 +456,9 @@ def precompute_text_embeddings(cache_dir=None):
     from transformers import AutoTokenizer, T5EncoderModel
 
     print("\n=== Precomputing Text Embeddings ===")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer", cache_dir=cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(DIFFUSERS_REPO, subfolder="tokenizer", cache_dir=cache_dir)
     text_encoder = T5EncoderModel.from_pretrained(
-        MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16, cache_dir=cache_dir)
+        DIFFUSERS_REPO, subfolder="text_encoder", torch_dtype=torch.float16, cache_dir=cache_dir)
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     text_encoder.to(device)
@@ -476,9 +478,30 @@ def precompute_text_embeddings(cache_dir=None):
     return prompt_embeds, prompt_mask
 
 
+def load_pipeline(config: MemoryConfig, cache_dir=None):
+    """Load pipeline with 2B distilled transformer."""
+    print("\n=== Loading Pipeline (2B distilled) ===")
+
+    transformer = LTXVideoTransformer3DModel.from_single_file(
+        f"https://huggingface.co/{CHECKPOINT_REPO}/blob/main/{TRANSFORMER_FILE}",
+        torch_dtype=torch.float16, cache_dir=cache_dir,
+    )
+    vae = AutoencoderKLLTXVideo.from_pretrained(
+        DIFFUSERS_REPO, subfolder="vae", torch_dtype=torch.float16, cache_dir=cache_dir)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        DIFFUSERS_REPO, subfolder="scheduler", cache_dir=cache_dir)
+
+    pipe = OmnimatteZero(
+        transformer=transformer, vae=vae, scheduler=scheduler,
+        text_encoder=None, tokenizer=None)
+    pipe.to("mps")
+    pipe = apply_memory_optimizations(pipe, config)
+    return pipe
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate total_mask.mp4 using self-attention (MPS)")
+        description="Generate total_mask.mp4 using self-attention (MPS, 2B distilled)")
     parser.add_argument("--video_folder", type=str, required=True)
     parser.add_argument("--preset", type=str, default="24gb", choices=["16gb", "24gb", "32gb"])
     parser.add_argument("--height", type=int, default=None)
@@ -495,13 +518,8 @@ if __name__ == "__main__":
     # Step 1: Encode prompt (then delete text encoder)
     prompt_embeds, prompt_mask = precompute_text_embeddings(args.cache_dir)
 
-    # Step 2: Load pipeline without text encoder
-    print("\nLoading pipeline...")
-    pipe = OmnimatteZero.from_pretrained(
-        MODEL_ID, text_encoder=None, tokenizer=None,
-        torch_dtype=torch.float16, cache_dir=args.cache_dir)
-    pipe.to("mps")
-    pipe = apply_memory_optimizations(pipe, config)
+    # Step 2: Load pipeline with 2B distilled transformer
+    pipe = load_pipeline(config, args.cache_dir)
 
     # Step 3: Generate mask
     device = "mps" if torch.backends.mps.is_available() else "cpu"

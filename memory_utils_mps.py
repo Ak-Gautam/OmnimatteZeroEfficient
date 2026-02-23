@@ -3,9 +3,10 @@ Memory optimization utilities for OmnimatteZero on Apple Silicon (MPS).
 
 Key insight: Apple Silicon uses UNIFIED memory — RAM and VRAM share the same pool.
 CPU↔GPU "offloading" does NOT free memory. Instead, we focus on:
+  - Using the 2B distilled model (6.34GB vs 28.6GB for 13B)
   - FP16 precision (halves memory vs FP32)
   - VAE tiling (reduces peak memory during encode/decode)
-  - Reduced resolution and frame count
+  - Text encoder decoupling (load → encode → delete before loading transformer)
   - Aggressive garbage collection
 """
 
@@ -17,31 +18,31 @@ from typing import Optional
 class MemoryConfig:
     """Configuration for memory optimizations on Apple Silicon."""
 
-    # Presets tuned for SHARED memory (much tighter than dedicated VRAM)
+    # Presets tuned for SHARED memory with 2B distilled model
     PRESETS = {
-        # Very aggressive — for 16GB unified memory Macs
+        # For 16GB unified memory Macs — aggressive settings
         "16gb": {
             "enable_vae_tiling": True,
             "enable_vae_slicing": True,
-            "max_resolution": (384, 576),
-            "max_frames": 25,  # 3 * 8 + 1
-            "default_inference_steps": 15,
+            "max_resolution": (480, 704),
+            "max_frames": 49,  # 6 * 8 + 1
+            "default_inference_steps": 8,
         },
-        # Moderate — for 24GB unified memory Macs (M4 Pro, etc.)
+        # For 24GB unified memory Macs (M4 Pro, etc.)
         "24gb": {
             "enable_vae_tiling": True,
             "enable_vae_slicing": False,
-            "max_resolution": (384, 576),
-            "max_frames": 33,  # 4 * 8 + 1
-            "default_inference_steps": 20,
+            "max_resolution": (480, 704),
+            "max_frames": 97,  # 12 * 8 + 1
+            "default_inference_steps": 8,
         },
-        # Less aggressive — for 32GB+ unified memory Macs
+        # For 32GB+ unified memory Macs
         "32gb": {
             "enable_vae_tiling": True,
             "enable_vae_slicing": False,
-            "max_resolution": (480, 704),
-            "max_frames": 49,  # 6 * 8 + 1
-            "default_inference_steps": 25,
+            "max_resolution": (512, 768),
+            "max_frames": 121,  # 15 * 8 + 1
+            "default_inference_steps": 10,
         },
     }
 
@@ -171,8 +172,6 @@ def auto_configure() -> MemoryConfig:
     """Auto-configure for Apple Silicon. Defaults to 24gb preset."""
     if torch.backends.mps.is_available():
         print("Detected: Apple Silicon (MPS)")
-        # Apple Silicon doesn't expose total memory via PyTorch,
-        # so we default to 24gb (common for M4 Pro)
         preset = "24gb"
         print(f"Using preset: {preset}")
         return MemoryConfig(preset)

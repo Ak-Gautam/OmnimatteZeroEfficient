@@ -1,13 +1,16 @@
 """
 Object Removal for OmnimatteZero — Apple Silicon (MPS) version.
 
+Uses the 2B distilled model (ltxv-2b-0.9.8-distilled) for efficient inference.
 Optimized for MacBook M4 Pro with 24GB unified memory.
+Supports 704x480 @ 97 frames on 24GB.
 
 Strategy:
   1. Load text encoder separately, encode prompts, then delete it
-  2. Load pipeline (transformer + VAE) without text encoder
-  3. Run inference with pre-computed embeddings
-  4. No upscaler (saves ~4GB)
+  2. Load 2B distilled transformer via from_single_file
+  3. Build pipeline with transformer + VAE (no text encoder)
+  4. Run inference with pre-computed embeddings
+  5. No upscaler (saves ~4GB)
 
 Usage:
     python object_removal_optimized_mps.py --preset 24gb --video cat_reflection
@@ -18,7 +21,9 @@ import os
 import argparse
 from tqdm import tqdm
 import torch
+from diffusers import LTXVideoTransformer3DModel, AutoencoderKLLTXVideo
 from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import export_to_video, load_video
 from transformers import AutoTokenizer, T5EncoderModel
 
@@ -33,11 +38,17 @@ from memory_utils_mps import (
     MemoryTracker,
 )
 
-MODEL_ID = "a-r-r-o-w/LTX-Video-0.9.7-diffusers"
+# The checkpoint repo containing model files
+CHECKPOINT_REPO = "Lightricks/LTX-Video"
+# The specific 2B distilled checkpoint file
+TRANSFORMER_FILE = "ltxv-2b-0.9.8-distilled.safetensors"
+# Reference diffusers-format repo for VAE, scheduler, tokenizer, text encoder config
+# (the 2B model shares the same VAE/scheduler as 0.9.7)
+DIFFUSERS_REPO = "a-r-r-o-w/LTX-Video-0.9.7-diffusers"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MPS-optimized object removal")
+    parser = argparse.ArgumentParser(description="MPS-optimized object removal (2B distilled)")
     parser.add_argument("--preset", type=str, default="24gb",
                         choices=["16gb", "24gb", "32gb"],
                         help="Memory preset (default: 24gb for M4 Pro)")
@@ -62,16 +73,16 @@ def precompute_text_embeddings(prompt: str, negative_prompt: str,
     Load text encoder, compute embeddings, then DELETE it to free memory.
 
     This is the key memory optimization: the T5 text encoder (~4.5GB in FP16)
-    never coexists in memory with the transformer (~5GB in FP16).
+    never coexists in memory with the transformer (~3.2GB in FP16 for 2B).
     """
     print("\n=== Precomputing Text Embeddings ===")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID, subfolder="tokenizer", cache_dir=cache_dir
+        DIFFUSERS_REPO, subfolder="tokenizer", cache_dir=cache_dir
     )
 
     text_encoder = T5EncoderModel.from_pretrained(
-        MODEL_ID, subfolder="text_encoder",
+        DIFFUSERS_REPO, subfolder="text_encoder",
         torch_dtype=torch.float16, cache_dir=cache_dir
     )
 
@@ -113,15 +124,49 @@ def precompute_text_embeddings(prompt: str, negative_prompt: str,
 
 
 def load_pipeline(config: MemoryConfig, cache_dir: str = None):
-    """Load OmnimatteZero pipeline WITHOUT text encoder."""
-    print("\n=== Loading Pipeline (no text encoder) ===")
+    """
+    Load OmnimatteZero pipeline with the 2B distilled transformer.
 
-    pipe = OmnimatteZero.from_pretrained(
-        MODEL_ID,
-        text_encoder=None,
-        tokenizer=None,
+    Steps:
+      1. Load the 2B distilled transformer from single file
+      2. Load VAE and scheduler from the diffusers-format repo
+      3. Assemble the pipeline without text_encoder/tokenizer
+    """
+    print("\n=== Loading Pipeline (2B distilled, no text encoder) ===")
+
+    # Load the 2B distilled transformer from the checkpoint repo
+    print(f"  Loading transformer: {CHECKPOINT_REPO}/{TRANSFORMER_FILE}")
+    transformer = LTXVideoTransformer3DModel.from_single_file(
+        f"https://huggingface.co/{CHECKPOINT_REPO}/blob/main/{TRANSFORMER_FILE}",
         torch_dtype=torch.float16,
         cache_dir=cache_dir,
+    )
+    print(f"  ✓ Transformer loaded ({sum(p.numel() for p in transformer.parameters()) / 1e9:.2f}B params)")
+
+    # Load VAE from the diffusers-format repo (shared across LTX versions)
+    print(f"  Loading VAE from {DIFFUSERS_REPO}")
+    vae = AutoencoderKLLTXVideo.from_pretrained(
+        DIFFUSERS_REPO,
+        subfolder="vae",
+        torch_dtype=torch.float16,
+        cache_dir=cache_dir,
+    )
+
+    # Load scheduler from the diffusers-format repo
+    print(f"  Loading scheduler from {DIFFUSERS_REPO}")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        DIFFUSERS_REPO,
+        subfolder="scheduler",
+        cache_dir=cache_dir,
+    )
+
+    # Assemble pipeline
+    pipe = OmnimatteZero(
+        transformer=transformer,
+        vae=vae,
+        scheduler=scheduler,
+        text_encoder=None,
+        tokenizer=None,
     )
 
     pipe.to("mps")
@@ -208,7 +253,7 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print("OmnimatteZero — MPS Object Removal")
+    print("OmnimatteZero — MPS Object Removal (2B Distilled)")
     print("=" * 60)
 
     if not torch.backends.mps.is_available():
@@ -223,6 +268,7 @@ def main():
 
     print(f"\nConfiguration:")
     print(f"  Preset: {args.preset}")
+    print(f"  Model: {CHECKPOINT_REPO}/{TRANSFORMER_FILE}")
     print(f"  Resolution: {width}x{height}")
     print(f"  Max frames: {max_frames}")
     print(f"  Inference steps: {num_inference_steps}")
@@ -234,7 +280,7 @@ def main():
         prompt, negative_prompt, args.cache_dir
     )
 
-    # Step 2: Load pipeline (transformer + VAE only)
+    # Step 2: Load pipeline (2B distilled transformer + VAE only)
     pipe = load_pipeline(config, args.cache_dir)
 
     # Step 3: Process videos
