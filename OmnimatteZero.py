@@ -9,11 +9,15 @@ from diffusers.utils import is_torch_xla_available
 from diffusers.utils.torch_utils import randn_tensor
 import torch
 import torch.nn.functional as F
-if is_torch_xla_available():
-    import torch_xla.core.xla_model as xm
 
-    XLA_AVAILABLE = True
-else:
+# XLA support (optional, for TPU acceleration)
+try:
+    if is_torch_xla_available():
+        import torch_xla.core.xla_model as xm
+        XLA_AVAILABLE = True
+    else:
+        XLA_AVAILABLE = False
+except Exception:
     XLA_AVAILABLE = False
 
 
@@ -403,7 +407,7 @@ class OmnimatteZero(LTXConditionPipeline):
             latents = self._denormalize_latents(
                 latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
             )
-            latents = latents.to(prompt_embeds.dtype)
+            latents = latents.to(self.vae.dtype)
 
             if not self.vae.config.timestep_conditioning:
                 timestep = None

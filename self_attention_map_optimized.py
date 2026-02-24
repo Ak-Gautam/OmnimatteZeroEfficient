@@ -2,10 +2,10 @@
 Memory-optimized Self-attention Map Extraction for OmnimatteZero.
 
 Generates total_mask.mp4 from video + object_mask by finding attention-based effects 
-(shadows, reflections). Optimized for 16GB VRAM GPUs.
+(shadows, reflections). Optimized for 16GB VRAM GPUs and Apple Silicon (MPS).
 
 Usage:
-    python self_attention_map_optimized.py --video_folder ./example_videos/your_video_name [--preset 16gb]
+    python self_attention_map_optimized.py --video_folder ./example_videos/your_video_name [--preset mps_24gb]
 """
 
 from typing import Optional, List, Dict, Tuple
@@ -20,13 +20,15 @@ import numpy as np
 import os
 import argparse
 
+from device_utils import (
+    get_device, get_device_type, is_cuda, is_mps,
+    get_optimal_dtype, clear_memory, print_memory_stats,
+    MemoryTracker
+)
 from memory_utils import (
     MemoryConfig,
     apply_memory_optimizations,
-    clear_memory,
-    print_memory_stats,
     round_frames_to_vae_compatible,
-    MemoryTracker,
     auto_configure
 )
 
@@ -44,6 +46,7 @@ class AttentionMapExtractor:
     """
     Extracts attention maps from transformer attention layers using forward hooks.
     Memory-optimized version that processes attention maps incrementally.
+    Cross-platform: supports CUDA and MPS.
     """
 
     def __init__(self, model: nn.Module, layer_indices: Optional[List[int]] = None,
@@ -53,7 +56,7 @@ class AttentionMapExtractor:
         self.layer_indices = layer_indices
         self.attention_type = attention_type
         self.average_over_heads = average_over_heads
-        self.max_layers_in_memory = max_layers_in_memory  # Limit stored layers for memory
+        self.max_layers_in_memory = max_layers_in_memory
         
         self._hooks = []
         self._attention_maps = {}
@@ -113,10 +116,9 @@ class AttentionMapExtractor:
 
             # Only keep a limited number of layers in memory
             if len(self._attention_maps) >= self.max_layers_in_memory:
-                # Remove oldest
                 oldest_key = min(self._attention_maps.keys())
                 del self._attention_maps[oldest_key]
-                torch.cuda.empty_cache()
+                clear_memory()
 
             try:
                 hidden_states = stored_inputs.get('hidden_states')
@@ -145,19 +147,19 @@ class AttentionMapExtractor:
 
                 scale = head_dim ** -0.5
                 
-                # Compute attention in chunks to save memory
+                # Compute attention
                 attention_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
                 attention_weights = F.softmax(attention_weights, dim=-1)
 
                 if self.average_over_heads:
                     attention_weights = attention_weights.mean(dim=1)
 
-                # Store on CPU immediately to free GPU memory
+                # Store on CPU immediately to free device memory
                 self._attention_maps[layer_idx] = attention_weights.detach().cpu().half()
                 
                 # Clear intermediate tensors
                 del query, key, attention_weights
-                torch.cuda.empty_cache()
+                clear_memory()
 
             except Exception as e:
                 pass  # Silently skip layers with errors
@@ -189,7 +191,7 @@ class AttentionMapExtractor:
     def clear_maps(self):
         """Clear stored attention maps."""
         self._attention_maps = {}
-        torch.cuda.empty_cache()
+        clear_memory()
 
     @contextmanager
     def extraction_context(self):
@@ -209,13 +211,14 @@ class AttentionMapExtractor:
 class SelfAttentionMapExtractionOptimized:
     """
     Memory-optimized orchestration of self-attention extraction for effects mask generation.
+    Cross-platform: supports CUDA and MPS.
     """
 
     def __init__(self, pipeline, extraction_timestep: float = 0.5, max_layers: int = 4):
         self.pipeline = pipeline
         self.extraction_timestep = extraction_timestep
         self.extractor = None
-        self.max_layers = max_layers  # Limit attention layers for memory
+        self.max_layers = max_layers
 
     def setup_extractor(self, layer_indices: Optional[List[int]] = None):
         """Setup the attention extractor with hooks."""
@@ -223,7 +226,6 @@ class SelfAttentionMapExtractionOptimized:
         
         # If no specific layers, use a subset for memory efficiency
         if layer_indices is None:
-            # Use every 4th layer to reduce memory 
             total_layers = sum(1 for n, m in transformer.named_modules() 
                               if n.endswith('attn1'))
             layer_indices = list(range(0, total_layers, max(1, total_layers // self.max_layers)))
@@ -446,7 +448,7 @@ class SelfAttentionMapExtractionOptimized:
         del attention_maps, mask_latent_all
         clear_memory()
 
-        # Stack and process on CPU to save GPU memory
+        # Stack and process on CPU to save device memory
         effects_latent = torch.stack(per_frame_effects, dim=1).to(device)
 
         # Upsample spatially
@@ -598,8 +600,9 @@ def main():
         description="Memory-optimized self-attention map extraction for total mask generation")
     parser.add_argument("--video_folder", type=str, required=True,
                         help="Folder containing video.mp4 and object_mask.mp4")
-    parser.add_argument("--preset", type=str, default="16gb", choices=["16gb", "24gb", "32gb"],
-                        help="Memory optimization preset")
+    parser.add_argument("--preset", type=str, default=None,
+                        choices=["mps_24gb", "16gb", "24gb", "32gb"],
+                        help="Memory optimization preset (auto-detected if not specified)")
     parser.add_argument("--height", type=int, default=None,
                         help="Processing height (auto-selected based on preset if not specified)")
     parser.add_argument("--width", type=int, default=None,
@@ -621,26 +624,31 @@ def main():
     print("=" * 60)
 
     # Initialize configuration
-    config = MemoryConfig(args.preset)
+    if args.preset:
+        config = MemoryConfig(args.preset)
+    else:
+        config = auto_configure()
     
     # Get resolution from preset or args
     height = args.height or config.max_resolution[0]
     width = args.width or config.max_resolution[1]
     
+    device = get_device()
+    dtype = get_optimal_dtype()
+    
     print(f"\nConfiguration:")
-    print(f"  Preset: {args.preset}")
+    print(f"  Preset: {config.preset}")
+    print(f"  Device: {get_device_type()}")
     print(f"  Resolution: {width}x{height}")
     print(f"  Max attention layers: {args.max_layers}")
 
-    print("\nLoading pipeline...")
-    pipe = OmnimatteZero.from_pretrained(
-        "a-r-r-o-w/LTX-Video-0.9.7-diffusers",
-        torch_dtype=torch.bfloat16,
-        cache_dir=args.cache_dir)
+    print("\nLoading pipeline from local checkpoint...")
+    from device_utils import load_pipeline as load_base_pipeline
+    pipe = load_base_pipeline(cache_dir=args.cache_dir)
     
     # Apply memory optimizations
     if not config.enable_model_cpu_offload:
-        pipe.to("cuda")
+        pipe.to(device)
     pipe = apply_memory_optimizations(pipe, config)
     
     print_memory_stats()
