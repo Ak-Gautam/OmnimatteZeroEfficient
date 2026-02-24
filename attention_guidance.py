@@ -8,10 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from device_utils import get_device
+
 
 class TAPNetCorrespondences:
-    def __init__(self, model_path=None, device="cuda", dtype=torch.float32):
-        self.device = device
+    def __init__(self, model_path=None, device=None, dtype=torch.float32):
+        self.device = device if device is not None else get_device()
         self.dtype = dtype
         self.model_path = model_path
         self.model = None
