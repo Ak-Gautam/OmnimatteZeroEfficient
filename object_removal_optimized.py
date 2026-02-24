@@ -2,10 +2,11 @@
 Optimized Object Removal for OmnimatteZero.
 
 This script removes objects and their effects (shadows, reflections) from videos
-using memory-efficient techniques optimized for consumer GPUs (16GB+ VRAM).
+using memory-efficient techniques optimized for consumer GPUs (16GB+ VRAM)
+and Apple Silicon (MPS).
 
 Usage:
-    python object_removal_optimized.py [--preset 16gb|24gb|32gb] [--video VIDEO_FOLDER]
+    python object_removal_optimized.py [--preset mps_24gb|16gb|24gb|32gb] [--video VIDEO_FOLDER]
 """
 
 import os
@@ -17,22 +18,26 @@ from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
 from diffusers.utils import export_to_video, load_video
 
 from OmnimatteZero import OmnimatteZero
+from device_utils import (
+    get_device, get_device_type, is_mps,
+    get_optimal_dtype, get_generator,
+    clear_memory, print_memory_stats, MemoryTracker,
+    load_pipeline as load_base_pipeline
+)
 from memory_utils import (
     MemoryConfig, 
     apply_memory_optimizations,
-    clear_memory,
-    print_memory_stats,
     round_to_vae_compatible,
     round_frames_to_vae_compatible,
-    MemoryTracker,
     auto_configure
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Memory-optimized object removal")
-    parser.add_argument("--preset", type=str, default="16gb", choices=["16gb", "24gb", "32gb"],
-                       help="Memory optimization preset")
+    parser.add_argument("--preset", type=str, default=None,
+                       choices=["mps_24gb", "16gb", "24gb", "32gb"],
+                       help="Memory optimization preset (auto-detected if not specified)")
     parser.add_argument("--video", type=str, default=None,
                        help="Specific video folder to process (processes all if not specified)")
     parser.add_argument("--base_dir", type=str, default="example_videos",
@@ -50,25 +55,29 @@ def parse_args():
     parser.add_argument("--skip_upscale", action="store_true",
                        help="Skip latent upscaling (faster, smaller output)")
     parser.add_argument("--cache_dir", type=str, default=None,
-                       help="Directory for model cache")
+                        help="Directory for model cache")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to .safetensors checkpoint (default: model_checkpoint/ltx-video-2b-v0.9.5.safetensors)")
     return parser.parse_args()
 
 
-def load_pipeline(config: MemoryConfig, cache_dir: str = None):
-    """Load and optimize the OmnimatteZero pipeline."""
+def load_pipeline(config: MemoryConfig, cache_dir: str = None, checkpoint: str = None):
+    """Load and optimize the OmnimatteZero pipeline from local checkpoint."""
     print("\n=== Loading Pipeline ===")
     
-    # Load with bfloat16 for memory efficiency
-    pipe = OmnimatteZero.from_pretrained(
-        "a-r-r-o-w/LTX-Video-0.9.7-diffusers",
-        torch_dtype=torch.bfloat16,
+    device = get_device()
+    
+    # Load from local safetensors checkpoint
+    pipe = load_base_pipeline(
+        checkpoint_path=checkpoint,
         cache_dir=cache_dir
     )
     
-    # Apply memory optimizations BEFORE moving to GPU
-    # This is crucial for group offloading to work properly
+    # Apply memory optimizations
+    # For MPS: enable_model_cpu_offload handles device placement
+    # For CUDA without model_cpu_offload: move to device first
     if not config.enable_model_cpu_offload:
-        pipe.to("cuda")
+        pipe.to(device)
     
     pipe = apply_memory_optimizations(pipe, config)
     
@@ -80,10 +89,12 @@ def load_upscaler(config: MemoryConfig, vae, cache_dir: str = None):
     """Load and optimize the latent upscaler pipeline."""
     print("\n=== Loading Upscaler ===")
     
+    dtype = get_optimal_dtype()
+    
     pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
         "a-r-r-o-w/LTX-Video-0.9.7-Latent-Spatial-Upsampler-diffusers",
         vae=vae,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
         cache_dir=cache_dir
     )
     
@@ -141,6 +152,8 @@ def process_video(
     
     with MemoryTracker("Generation"):
         # Generate with optimized settings
+        generator = get_generator(seed=1)
+        
         output = pipe.my_call(
             conditions=[condition1, condition2],
             prompt=prompt,
@@ -149,7 +162,7 @@ def process_video(
             height=downscaled_height,
             num_frames=num_frames,
             num_inference_steps=num_inference_steps,
-            generator=torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(1),
+            generator=generator,
             output_type="pil",
         )
         video_output = output.frames[0]
@@ -181,7 +194,10 @@ def main():
     print("=" * 60)
     
     # Initialize configuration
-    config = MemoryConfig(args.preset)
+    if args.preset:
+        config = MemoryConfig(args.preset)
+    else:
+        config = auto_configure()
     
     # Get preset defaults or use command line overrides
     height = args.height or config.max_resolution[0]
@@ -190,30 +206,36 @@ def main():
     
     # Inference steps based on preset
     default_steps = {
-        "16gb": 20,  # Reduced for memory
+        "mps_24gb": 30,  # User-proven: 30 steps works well
+        "16gb": 20,
         "24gb": 25,
         "32gb": 30
     }
-    num_inference_steps = args.num_inference_steps or default_steps.get(args.preset, 25)
+    num_inference_steps = args.num_inference_steps or default_steps.get(config.preset, 25)
     
     print(f"\nConfiguration:")
-    print(f"  Preset: {args.preset}")
+    print(f"  Preset: {config.preset}")
+    print(f"  Device: {get_device_type()}")
     print(f"  Resolution: {width}x{height}")
     print(f"  Max frames: {max_frames}")
     print(f"  Inference steps: {num_inference_steps}")
     print(f"  Upscaling: {'No' if args.skip_upscale else 'Yes'}")
     
     # Load pipeline
-    pipe = load_pipeline(config, args.cache_dir)
+    pipe = load_pipeline(config, args.cache_dir, args.checkpoint)
     
-    # Load upscaler if needed
+    # Load upscaler if needed (skip on MPS by default to save memory)
     pipe_upsample = None
     if not args.skip_upscale:
-        try:
-            pipe_upsample = load_upscaler(config, pipe.vae, args.cache_dir)
-        except Exception as e:
-            print(f"Warning: Could not load upscaler: {e}")
-            print("Continuing without upscaling...")
+        if is_mps():
+            print("Note: Skipping upscaler on Apple Silicon to conserve memory.")
+            print("  Use a CUDA GPU or run upscaling separately for higher resolution.")
+        else:
+            try:
+                pipe_upsample = load_upscaler(config, pipe.vae, args.cache_dir)
+            except Exception as e:
+                print(f"Warning: Could not load upscaler: {e}")
+                print("Continuing without upscaling...")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -237,7 +259,7 @@ def main():
         
         video_path = os.path.join(video_dir, "video.mp4")
         mask_path = os.path.join(video_dir, "total_mask.mp4")
-        output_path = os.path.join(args.output_dir, f"{f_name}.mp4")
+        output_path = os.path.join(args.output_dir, f"{f_name}_mps.mp4")
         
         if not os.path.exists(video_path):
             print(f"  Skipping: video.mp4 not found")
