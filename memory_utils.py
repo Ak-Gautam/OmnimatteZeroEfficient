@@ -1,11 +1,20 @@
 """
 Memory optimization utilities for OmnimatteZero.
-Enables running on consumer GPUs (16GB VRAM) with various optimization techniques.
+Enables running on consumer GPUs (16GB VRAM) and Apple Silicon (MPS).
+Cross-platform: supports CUDA, MPS, and CPU backends.
 """
 
 import torch
 import gc
 from typing import Optional, Literal
+from device_utils import (
+    get_device, get_device_type, is_cuda, is_mps, is_cpu,
+    get_optimal_dtype, get_compute_dtype,
+    clear_memory, get_memory_usage, get_memory_reserved,
+    get_total_memory, get_device_name,
+    print_memory_stats, print_device_info,
+    MemoryTracker
+)
 
 
 class MemoryConfig:
@@ -13,7 +22,22 @@ class MemoryConfig:
     
     # Presets for different VRAM targets
     PRESETS = {
-        # 16GB VRAM - Aggressive optimizations
+        # Apple Silicon 24GB unified memory — proven config (user tested)
+        "mps_24gb": {
+            "enable_layerwise_casting": False,  # FP8 not supported on MPS
+            "storage_dtype": torch.float16,
+            "compute_dtype": torch.float16,
+            "enable_group_offload": False,  # No CUDA streams on MPS
+            "offload_type": None,
+            "use_stream": False,
+            "enable_vae_tiling": True,
+            "enable_vae_slicing": True,
+            "enable_model_cpu_offload": True,  # Effective on unified memory
+            "enable_attention_slicing": True,  # Critical for MPS memory
+            "max_resolution": (480, 704),  # Proven on M4 Pro
+            "max_frames": 97,  # ~4 seconds at 24fps
+        },
+        # 16GB VRAM - Aggressive optimizations (CUDA)
         "16gb": {
             "enable_layerwise_casting": True,
             "storage_dtype": torch.float8_e4m3fn,
@@ -24,10 +48,11 @@ class MemoryConfig:
             "enable_vae_tiling": True,
             "enable_vae_slicing": True,
             "enable_model_cpu_offload": True,
-            "max_resolution": (480, 704),  # Slightly reduced
-            "max_frames": 97,  # Reduced frame count
+            "enable_attention_slicing": False,
+            "max_resolution": (480, 704),
+            "max_frames": 97,
         },
-        # 24GB VRAM - Moderate optimizations
+        # 24GB VRAM - Moderate optimizations (CUDA)
         "24gb": {
             "enable_layerwise_casting": True,
             "storage_dtype": torch.float8_e4m3fn,
@@ -38,10 +63,11 @@ class MemoryConfig:
             "enable_vae_tiling": True,
             "enable_vae_slicing": False,
             "enable_model_cpu_offload": False,
+            "enable_attention_slicing": False,
             "max_resolution": (512, 768),
             "max_frames": 121,
         },
-        # 32GB+ VRAM - Minimal optimizations for quality
+        # 32GB+ VRAM - Minimal optimizations for quality (CUDA)
         "32gb": {
             "enable_layerwise_casting": False,
             "storage_dtype": torch.bfloat16,
@@ -52,6 +78,7 @@ class MemoryConfig:
             "enable_vae_tiling": True,
             "enable_vae_slicing": False,
             "enable_model_cpu_offload": False,
+            "enable_attention_slicing": False,
             "max_resolution": (512, 768),
             "max_frames": 161,
         },
@@ -62,7 +89,7 @@ class MemoryConfig:
         Initialize memory configuration.
         
         Args:
-            preset: One of "16gb", "24gb", "32gb" 
+            preset: One of "mps_24gb", "16gb", "24gb", "32gb" 
         """
         if preset not in self.PRESETS:
             raise ValueError(f"Unknown preset: {preset}. Choose from {list(self.PRESETS.keys())}")
@@ -74,32 +101,21 @@ class MemoryConfig:
         self.preset = preset
 
 
-def get_optimal_dtype():
-    """Get the optimal dtype for the current GPU."""
-    if torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability()
-        # SM 8.9+ (Ada Lovelace, Hopper) supports fp8 natively
-        if capability[0] >= 8 and capability[1] >= 9:
-            return torch.float8_e4m3fn, torch.bfloat16
-        # SM 8.0+ (Ampere) supports bf16
-        elif capability[0] >= 8:
-            return torch.bfloat16, torch.bfloat16
-        else:
-            return torch.float16, torch.float16
-    return torch.float32, torch.float32
-
-
 def apply_memory_optimizations(pipe, config: MemoryConfig, verbose: bool = True):
     """
     Apply memory optimizations to a diffusion pipeline.
+    Cross-platform: works on CUDA, MPS, and CPU.
     
     Args:
         pipe: The diffusion pipeline (OmnimatteZero or similar)
         config: Memory configuration to apply
         verbose: Print optimization info
     """
+    device = get_device()
+    device_type = get_device_type()
+    
     if verbose:
-        print(f"Applying memory optimizations for {config.preset} preset...")
+        print(f"Applying memory optimizations for {config.preset} preset on {device_type}...")
     
     # 1. Enable VAE tiling (reduces VAE memory usage significantly)
     if config.enable_vae_tiling:
@@ -113,8 +129,14 @@ def apply_memory_optimizations(pipe, config: MemoryConfig, verbose: bool = True)
         if verbose:
             print("  ✓ VAE slicing enabled")
     
-    # 3. Apply FP8 layerwise casting to transformer
-    if config.enable_layerwise_casting and hasattr(pipe.transformer, 'enable_layerwise_casting'):
+    # 3. Enable attention slicing (critical for MPS, optional for CUDA)
+    if config.enable_attention_slicing and hasattr(pipe, 'enable_attention_slicing'):
+        pipe.enable_attention_slicing()
+        if verbose:
+            print("  ✓ Attention slicing enabled")
+    
+    # 4. Apply FP8 layerwise casting to transformer (CUDA only)
+    if config.enable_layerwise_casting and is_cuda() and hasattr(pipe.transformer, 'enable_layerwise_casting'):
         try:
             pipe.transformer.enable_layerwise_casting(
                 storage_dtype=config.storage_dtype,
@@ -126,8 +148,8 @@ def apply_memory_optimizations(pipe, config: MemoryConfig, verbose: bool = True)
             if verbose:
                 print(f"  ⚠ Layerwise casting failed: {e}")
     
-    # 4. Apply group offloading
-    if config.enable_group_offload:
+    # 5. Apply group offloading (CUDA with streams only)
+    if config.enable_group_offload and is_cuda():
         try:
             from diffusers.hooks import apply_group_offloading
             
@@ -184,7 +206,7 @@ def apply_memory_optimizations(pipe, config: MemoryConfig, verbose: bool = True)
                 if verbose:
                     print("  ✓ Model CPU offload enabled (fallback)")
     
-    # 5. Enable model CPU offload if no group offloading
+    # 6. Enable model CPU offload if no group offloading
     elif config.enable_model_cpu_offload:
         pipe.enable_model_cpu_offload()
         if verbose:
@@ -194,13 +216,16 @@ def apply_memory_optimizations(pipe, config: MemoryConfig, verbose: bool = True)
     clear_memory()
     
     if verbose:
-        print(f"  Memory after optimization: {get_gpu_memory_usage():.2f} GB")
+        mem = get_memory_usage()
+        print(f"  Memory after optimization: {mem:.2f} GB")
     
     return pipe
 
 
 def apply_memory_optimizations_vae_only(vae, config: MemoryConfig, verbose: bool = True):
     """Apply optimizations to a standalone VAE."""
+    device = get_device()
+    
     if verbose:
         print(f"Applying VAE memory optimizations...")
     
@@ -209,7 +234,7 @@ def apply_memory_optimizations_vae_only(vae, config: MemoryConfig, verbose: bool
         if verbose:
             print("  ✓ VAE tiling enabled")
     
-    if config.enable_group_offload:
+    if config.enable_group_offload and is_cuda():
         try:
             from diffusers.hooks import apply_group_offloading
             apply_group_offloading(
@@ -226,44 +251,10 @@ def apply_memory_optimizations_vae_only(vae, config: MemoryConfig, verbose: bool
     return vae
 
 
-def clear_memory():
-    """Aggressively clear GPU and CPU memory."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-
-def get_gpu_memory_usage() -> float:
-    """Get current GPU memory usage in GB."""
-    if torch.cuda.is_available():
-        return torch.cuda.memory_allocated() / 1024**3
-    return 0.0
-
-
-def get_gpu_memory_reserved() -> float:
-    """Get total reserved GPU memory in GB."""
-    if torch.cuda.is_available():
-        return torch.cuda.memory_reserved() / 1024**3
-    return 0.0
-
-
-def print_memory_stats():
-    """Print detailed memory statistics."""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"GPU Memory: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved, {max_allocated:.2f} GB peak")
-    else:
-        print("CUDA not available")
-
-
 def estimate_memory_requirement(height: int, width: int, num_frames: int, batch_size: int = 1) -> float:
     """
-    Estimate VRAM requirement for given video dimensions.
-    
-    Returns estimated VRAM in GB.
+    Estimate memory requirement for given video dimensions.
+    Returns estimated memory in GB.
     """
     # LTX-Video specific calculations
     vae_spatial_compression = 32
@@ -274,9 +265,8 @@ def estimate_memory_requirement(height: int, width: int, num_frames: int, batch_
     latent_w = width // vae_spatial_compression
     latent_frames = (num_frames - 1) // vae_temporal_compression + 1
     
-    # Transformer memory (rough estimate)
-    # Model weights: ~12GB for LTX-Video 0.9.7
-    model_memory = 12.0
+    # Model weights: ~4-5GB for LTX-Video 2B in FP16
+    model_memory = 5.0
     
     # Latent memory (with classifier-free guidance, 2x)
     latent_memory = 2 * batch_size * latent_channels * latent_frames * latent_h * latent_w * 2 / 1024**3
@@ -284,24 +274,47 @@ def estimate_memory_requirement(height: int, width: int, num_frames: int, batch_
     # VAE memory for encoding/decoding
     vae_memory = batch_size * 3 * num_frames * height * width * 2 / 1024**3
     
-    # Activation memory (rough estimate, depends on batch size)
+    # Activation memory (rough estimate)
     activation_memory = latent_memory * 4
     
     total = model_memory + latent_memory + vae_memory + activation_memory
     return total
 
 
-def get_recommended_settings(available_vram: float) -> dict:
+def get_recommended_settings(available_memory: float, device_type: str = None) -> dict:
     """
-    Get recommended settings based on available VRAM.
+    Get recommended settings based on available memory.
     
     Args:
-        available_vram: Available VRAM in GB
-        
-    Returns:
-        Dictionary with recommended settings
+        available_memory: Available memory in GB
+        device_type: Override device type detection ('cuda', 'mps', 'cpu')
     """
-    if available_vram >= 32:
+    if device_type is None:
+        device_type = get_device_type()
+    
+    if device_type == "mps":
+        # Apple Silicon unified memory — OS/apps use some of the pool
+        effective_memory = available_memory * 0.65  # ~65% available for ML
+        if effective_memory >= 16:
+            return {
+                "preset": "mps_24gb",
+                "height": 480,
+                "width": 704,
+                "num_frames": 97,
+                "num_inference_steps": 30,
+            }
+        else:
+            return {
+                "preset": "mps_24gb",
+                "height": 384,
+                "width": 576,
+                "num_frames": 65,
+                "num_inference_steps": 20,
+                "warning": "Limited unified memory. Results may be degraded.",
+            }
+    
+    # CUDA presets
+    if available_memory >= 32:
         return {
             "preset": "32gb",
             "height": 512,
@@ -309,7 +322,7 @@ def get_recommended_settings(available_vram: float) -> dict:
             "num_frames": 161,
             "num_inference_steps": 30,
         }
-    elif available_vram >= 24:
+    elif available_memory >= 24:
         return {
             "preset": "24gb",
             "height": 512,
@@ -317,7 +330,7 @@ def get_recommended_settings(available_vram: float) -> dict:
             "num_frames": 121,
             "num_inference_steps": 25,
         }
-    elif available_vram >= 16:
+    elif available_memory >= 16:
         return {
             "preset": "16gb",
             "height": 480,
@@ -350,49 +363,30 @@ def round_frames_to_vae_compatible(num_frames: int, temporal_ratio: int = 8) -> 
     return k * temporal_ratio + 1
 
 
-class MemoryTracker:
-    """Context manager for tracking memory usage during operations."""
-    
-    def __init__(self, name: str = "Operation"):
-        self.name = name
-        self.start_memory = 0
-        self.peak_memory = 0
-    
-    def __enter__(self):
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-            self.start_memory = torch.cuda.memory_allocated()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if torch.cuda.is_available():
-            end_memory = torch.cuda.memory_allocated()
-            self.peak_memory = torch.cuda.max_memory_allocated()
-            
-            print(f"{self.name}:")
-            print(f"  Start: {self.start_memory / 1024**3:.2f} GB")
-            print(f"  End: {end_memory / 1024**3:.2f} GB")
-            print(f"  Peak: {self.peak_memory / 1024**3:.2f} GB")
-            print(f"  Delta: {(end_memory - self.start_memory) / 1024**3:.2f} GB")
-
-
 # Auto-detect and set optimal configuration
 def auto_configure() -> MemoryConfig:
-    """Automatically configure based on available GPU memory."""
-    if torch.cuda.is_available():
-        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        print(f"Detected GPU: {torch.cuda.get_device_name(0)}")
-        print(f"Total VRAM: {total_memory:.1f} GB")
-        
+    """Automatically configure based on available device and memory."""
+    device_type = get_device_type()
+    total_memory = get_total_memory()
+    device_name = get_device_name()
+    
+    print(f"Detected device: {device_name}")
+    print(f"Total memory: {total_memory:.1f} GB")
+    print(f"Backend: {device_type}")
+    
+    if device_type == "mps":
+        preset = "mps_24gb"
+        print(f"Apple Silicon detected — using preset: {preset}")
+    elif device_type == "cuda":
         if total_memory >= 32:
             preset = "32gb"
         elif total_memory >= 24:
             preset = "24gb"
         else:
             preset = "16gb"
-        
-        print(f"Using preset: {preset}")
-        return MemoryConfig(preset)
+        print(f"CUDA GPU detected — using preset: {preset}")
     else:
-        print("No CUDA device found, using CPU (will be very slow)")
-        return MemoryConfig("16gb")
+        preset = "16gb"
+        print("No GPU found — using CPU with 16gb preset (will be very slow)")
+    
+    return MemoryConfig(preset)
