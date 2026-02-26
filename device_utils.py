@@ -252,6 +252,8 @@ def load_pipeline(
     cache_dir: Optional[str] = None,
     dtype: Optional[torch.dtype] = None,
     pipeline_class=None,
+    load_text_encoder: bool = True,
+    force_vae_fp32: bool = True,
 ):
     """
     Load the OmnimatteZero pipeline from a local safetensors checkpoint.
@@ -268,8 +270,6 @@ def load_pipeline(
     Returns:
         Loaded pipeline instance
     """
-    from transformers import T5EncoderModel, T5TokenizerFast
-    
     if pipeline_class is None:
         from OmnimatteZero import OmnimatteZero
         pipeline_class = OmnimatteZero
@@ -289,35 +289,44 @@ def load_pipeline(
     print(f"Loading checkpoint: {os.path.basename(checkpoint_path)}")
     print(f"  dtype: {dtype}")
     print(f"  size: {os.path.getsize(checkpoint_path) / 1024**3:.1f} GB")
-    
-    # Load T5 text encoder and tokenizer from official Lightricks repo
-    # These are cached after first download (~few GB)
-    print(f"Loading T5 encoder from {T5_ENCODER_REPO}...")
-    text_encoder = T5EncoderModel.from_pretrained(
-        T5_ENCODER_REPO,
-        subfolder="text_encoder",
-        torch_dtype=dtype,
-        cache_dir=cache_dir
-    )
-    tokenizer = T5TokenizerFast.from_pretrained(
-        T5_ENCODER_REPO,
-        subfolder="tokenizer",
-        cache_dir=cache_dir
-    )
-    
-    # Load pipeline from single safetensors file with the T5 encoder
-    print(f"Loading pipeline from local checkpoint...")
+
+    text_encoder = None
+    tokenizer = None
+    if load_text_encoder:
+        # Load T5 text encoder and tokenizer from official Lightricks repo
+        # These are cached after first download (~few GB)
+        from transformers import T5EncoderModel, T5TokenizerFast
+
+        print(f"Loading T5 encoder from {T5_ENCODER_REPO}...")
+        text_encoder = T5EncoderModel.from_pretrained(
+            T5_ENCODER_REPO,
+            subfolder="text_encoder",
+            torch_dtype=dtype,
+            cache_dir=cache_dir,
+        )
+        tokenizer = T5TokenizerFast.from_pretrained(
+            T5_ENCODER_REPO,
+            subfolder="tokenizer",
+            cache_dir=cache_dir,
+        )
+    else:
+        print("Skipping T5 encoder/tokenizer load (expects prompt_embeds at runtime)")
+
+    # Load pipeline from local checkpoint. If text encoder/tokenizer are None, the pipeline
+    # can still run as long as prompt embeddings are provided.
+    print("Loading pipeline from local checkpoint...")
     pipe = pipeline_class.from_single_file(
         checkpoint_path,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         torch_dtype=dtype,
     )
-    
+
     # CRITICAL: Force VAE to float32 to avoid numerical instability/garbage output
-    # LTX-Video VAE is sensitive and overflows in FP16 on MPS/some GPUs
-    print("Forcing VAE to float32 for stability...")
-    pipe.vae = pipe.vae.to(dtype=torch.float32)
+    # LTX-Video VAE is sensitive and can overflow in FP16 on MPS/some GPUs
+    if force_vae_fp32:
+        print("Forcing VAE to float32 for stability...")
+        pipe.vae = pipe.vae.to(dtype=torch.float32)
     
     print(f"Pipeline loaded successfully! (2B parameter model)")
     return pipe
