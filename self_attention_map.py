@@ -204,11 +204,20 @@ class SelfAttentionMapExtraction:
         noise_level: Not used, kept for API compatibility
     """
 
-    def __init__(self, pipeline, extraction_timestep: float = 0.5, noise_level: float = 0.5):
+    def __init__(
+        self,
+        pipeline,
+        extraction_timestep: float = 0.5,
+        noise_level: float = 0.5,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        prompt_attention_mask: Optional[torch.Tensor] = None,
+    ):
         self.pipeline = pipeline
         self.extraction_timestep = extraction_timestep
         self.noise_level = noise_level
         self.extractor = None
+        self._prompt_embeds = prompt_embeds
+        self._prompt_attention_mask = prompt_attention_mask
 
     def setup_extractor(self, layer_indices: Optional[List[int]] = None):
         """Setup the attention extractor with hooks."""
@@ -228,7 +237,9 @@ class SelfAttentionMapExtraction:
     @torch.no_grad()
     def extract_from_video(self, video: torch.Tensor, prompt: str = "",
                            height: Optional[int] = None, width: Optional[int] = None,
-                           generator: Optional[torch.Generator] = None
+                           generator: Optional[torch.Generator] = None,
+                           prompt_embeds: Optional[torch.Tensor] = None,
+                           prompt_attention_mask: Optional[torch.Tensor] = None,
                            ) -> Tuple[Dict[int, torch.Tensor], Tuple[int, int, int]]:
         """
         Extract self-attention maps from video.
@@ -275,10 +286,20 @@ class SelfAttentionMapExtraction:
 
         timestep = torch.tensor([self.extraction_timestep * 1000], device=device)
 
-        # Encode prompt
-        prompt_embeds, prompt_attention_mask, _, _ = self.pipeline.encode_prompt(
-            prompt=prompt, negative_prompt=None, do_classifier_free_guidance=False,
-            num_videos_per_prompt=1, device=device)
+        # Encode prompt (or reuse cached embeddings)
+        prompt_embeds = prompt_embeds if prompt_embeds is not None else self._prompt_embeds
+        prompt_attention_mask = (
+            prompt_attention_mask if prompt_attention_mask is not None else self._prompt_attention_mask
+        )
+
+        if prompt_embeds is None or prompt_attention_mask is None:
+            prompt_embeds, prompt_attention_mask, _, _ = self.pipeline.encode_prompt(
+                prompt=prompt,
+                negative_prompt=None,
+                do_classifier_free_guidance=False,
+                num_videos_per_prompt=1,
+                device=device,
+            )
 
         num_latent_frames = latents.shape[2]
         latent_height = latents.shape[3]
@@ -368,7 +389,14 @@ class SelfAttentionMapExtraction:
         B, C, T, H, W = video_tensor.shape
 
         # Extract attention maps
-        attention_maps, latent_dims = self.extract_from_video(video_tensor, height=H, width=W, generator=generator)
+        attention_maps, latent_dims = self.extract_from_video(
+            video_tensor,
+            height=H,
+            width=W,
+            generator=generator,
+            prompt_embeds=self._prompt_embeds,
+            prompt_attention_mask=self._prompt_attention_mask,
+        )
         num_latent_frames, latent_height, latent_width = latent_dims
         spatial_size = latent_height * latent_width
 
@@ -537,9 +565,17 @@ class SelfAttentionMapExtraction:
         return total_mask
 
 
-def generate_total_mask_for_folder(pipeline, folder_path: str, output_folder: Optional[str] = None,
-                                   height: int = 512, width: int = 768,
-                                   threshold: Optional[float] = None, dilation_size: int = 3):
+def generate_total_mask_for_folder(
+    pipeline,
+    folder_path: str,
+    output_folder: Optional[str] = None,
+    height: int = 512,
+    width: int = 768,
+    threshold: Optional[float] = None,
+    dilation_size: int = 3,
+    prompt_embeds: Optional[torch.Tensor] = None,
+    prompt_attention_mask: Optional[torch.Tensor] = None,
+):
     """
     Process a folder containing video.mp4 and object_mask.mp4, generate total_mask.mp4.
 
@@ -569,7 +605,12 @@ def generate_total_mask_for_folder(pipeline, folder_path: str, output_folder: Op
         print(f"Object mask not found in {folder_path}")
         return None
 
-    extractor = SelfAttentionMapExtraction(pipeline, extraction_timestep=0.5)
+    extractor = SelfAttentionMapExtraction(
+        pipeline,
+        extraction_timestep=0.5,
+        prompt_embeds=prompt_embeds,
+        prompt_attention_mask=prompt_attention_mask,
+    )
     extractor.setup_extractor()
 
     try:
@@ -598,21 +639,129 @@ if __name__ == "__main__":
                         help="Dilation size for smoothing edges (default: 3)")
     parser.add_argument("--cache_dir", type=str, default="",
                         help="HuggingFace cache directory")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to local ltx-video safetensors checkpoint")
+    parser.add_argument("--preset", type=str, default="mps_24gb",
+                        choices=["mps_24gb", "16gb", "24gb", "32gb"],
+                        help="Memory preset (affects defaults, mainly for MPS)")
+    parser.add_argument("--prompt", type=str, default="",
+                        help="Prompt used when encoding for attention extraction")
+    parser.add_argument("--use_prompt_cache", action="store_true",
+                        help="Cache and reuse T5 prompt embeddings")
     args = parser.parse_args()
 
-    from OmnimatteZero import OmnimatteZero
+    from device_utils import DEFAULT_CHECKPOINT, get_device, get_optimal_dtype, clear_memory, load_pipeline
+    from prompt_cache import (
+        build_prompt_cache_key,
+        find_legacy_prompt_cache,
+        get_prompt_cache_path,
+        load_prompt_cache,
+        move_prompt_cache_to_device,
+        normalize_cached_prompt_tensors,
+        save_prompt_cache,
+    )
+
+    device = get_device()
+    dtype = get_optimal_dtype()
+    checkpoint = args.checkpoint or DEFAULT_CHECKPOINT
+
+    prompt_embeds = None
+    prompt_attention_mask = None
+
+    # Load cached embeddings (if requested)
+    if args.use_prompt_cache:
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        cache_dir = os.path.join(project_root, "cached_embeddings")
+        cache_key = build_prompt_cache_key(
+            prompt=args.prompt,
+            negative_prompt=None,
+            checkpoint_path=checkpoint,
+            max_sequence_length=256,
+            num_videos_per_prompt=1,
+            dtype=dtype,
+        )
+        cache_path = get_prompt_cache_path(cache_dir, cache_key)
+        if os.path.exists(cache_path):
+            cached = load_prompt_cache(cache_path)
+            cached = normalize_cached_prompt_tensors(cached, require_negative=False)
+            moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
+            prompt_embeds = moved.get("prompt_embeds")
+            prompt_attention_mask = moved.get("prompt_attention_mask")
+            print(f"Loaded prompt cache: {os.path.basename(cache_path)}")
+        else:
+            legacy_path = find_legacy_prompt_cache(cache_dir, args.prompt)
+            if legacy_path is not None:
+                cached = load_prompt_cache(legacy_path)
+                cached = normalize_cached_prompt_tensors(cached, require_negative=False)
+                moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
+                prompt_embeds = moved.get("prompt_embeds")
+                prompt_attention_mask = moved.get("prompt_attention_mask")
+                print(f"Prompt cache miss for keyed file; using legacy cache: {os.path.basename(legacy_path)}")
+            else:
+                print("Prompt cache miss; will compute and save embeddings.")
 
     print("Loading pipeline...")
-    pipe = OmnimatteZero.from_pretrained(
-        "a-r-r-o-w/LTX-Video-0.9.7-diffusers",
-        torch_dtype=torch.bfloat16,
-        cache_dir=args.cache_dir)
-    pipe.to("cuda")
+    pipe = load_pipeline(
+        checkpoint_path=checkpoint,
+        cache_dir=args.cache_dir,
+        dtype=dtype,
+        load_text_encoder=prompt_embeds is None,
+        force_vae_fp32=True,
+    )
+
+    # Memory reducers
+    if hasattr(pipe, "enable_attention_slicing"):
+        try:
+            pipe.enable_attention_slicing("max")
+        except Exception:
+            pipe.enable_attention_slicing()
+    if hasattr(pipe, "enable_vae_slicing"):
+        pipe.enable_vae_slicing()
     pipe.vae.enable_tiling()
 
+    pipe.to(device)
+    clear_memory()
+
+    # Compute embeddings if needed, then optionally save and free the text encoder
+    if args.use_prompt_cache and prompt_embeds is None:
+        pe, pam, _, _ = pipe.encode_prompt(
+            prompt=args.prompt,
+            negative_prompt=None,
+            do_classifier_free_guidance=False,
+            num_videos_per_prompt=1,
+            device=pipe._execution_device,
+            max_sequence_length=256,
+        )
+        prompt_embeds = pe.to(device=device, dtype=dtype)
+        prompt_attention_mask = pam.to(device=device)
+
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        cache_dir = os.path.join(project_root, "cached_embeddings")
+        cache_key = build_prompt_cache_key(
+            prompt=args.prompt,
+            negative_prompt=None,
+            checkpoint_path=checkpoint,
+            max_sequence_length=256,
+            num_videos_per_prompt=1,
+            dtype=dtype,
+        )
+        cache_path = get_prompt_cache_path(cache_dir, cache_key)
+        save_prompt_cache(cache_path, {"prompt_embeds": pe, "prompt_attention_mask": pam})
+        print(f"Saved prompt cache: {os.path.basename(cache_path)}")
+
+        pipe.text_encoder = None
+        pipe.tokenizer = None
+        clear_memory()
+
     generate_total_mask_for_folder(
-        pipe, args.video_folder,
-        height=args.height, width=args.width,
-        threshold=args.threshold, dilation_size=args.dilation)
+        pipe,
+        args.video_folder,
+        height=args.height,
+        width=args.width,
+        threshold=args.threshold,
+        dilation_size=args.dilation,
+        prompt_embeds=prompt_embeds,
+        prompt_attention_mask=prompt_attention_mask,
+    )
 
     print("Done!")
