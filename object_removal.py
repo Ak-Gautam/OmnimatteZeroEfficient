@@ -38,6 +38,7 @@ from device_utils import (
 from memory_utils import MemoryConfig
 from prompt_cache import (
     build_prompt_cache_key,
+    encode_prompts_with_t5_only,
     find_legacy_prompt_cache,
     get_prompt_cache_path,
     load_prompt_cache,
@@ -115,7 +116,7 @@ def run_object_removal(
 
     print_device_info()
 
-    # 1) Load cached embeddings if available.
+    # 1) Build/load prompt embeddings first (before loading video model).
     prompt_tensors_cpu = None
     prompt_cache_path = None
     if use_prompt_cache:
@@ -137,11 +138,37 @@ def run_object_removal(
                 print(f"Prompt cache miss for keyed file; using legacy cache: {os.path.basename(legacy_path)}")
                 prompt_tensors_cpu = load_prompt_cache(legacy_path)
             else:
-                print("Prompt cache miss; will compute and save embeddings.")
+                print("Prompt cache miss; loading T5 encoder only to compute embeddings...")
+                prompt_tensors_cpu = encode_prompts_with_t5_only(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    max_sequence_length=max_sequence_length,
+                    num_videos_per_prompt=1,
+                    dtype=dtype,
+                    cache_dir=cache_dir,
+                    device=device,
+                    do_classifier_free_guidance=True,
+                )
+                save_prompt_cache(prompt_cache_path, prompt_tensors_cpu)
+                print(f"Saved prompt embeddings cache: {os.path.basename(prompt_cache_path)}")
+                clear_memory()
+    else:
+        print("Prompt cache disabled; loading T5 encoder only for one-time prompt encoding...")
+        prompt_tensors_cpu = encode_prompts_with_t5_only(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            max_sequence_length=max_sequence_length,
+            num_videos_per_prompt=1,
+            dtype=dtype,
+            cache_dir=cache_dir,
+            device=device,
+            do_classifier_free_guidance=True,
+        )
+        clear_memory()
 
     # 2) Load pipeline.
-    # If we already have cached prompt embeddings, we can skip loading T5.
-    load_text_encoder = not (use_prompt_cache and prompt_tensors_cpu is not None)
+    # Always skip loading T5 in the video pipeline.
+    load_text_encoder = False
 
     print("Loading OmnimatteZero pipeline...")
     pipe = load_pipeline(
@@ -163,17 +190,28 @@ def run_object_removal(
         pipe.enable_vae_slicing()
     pipe.vae.enable_tiling()
 
-    # CPU offload configuration (effective on Apple Silicon to reduce MPS residency).
+    # CPU offload configuration.
+    # NOTE: On MPS (unified memory), cpu offload is counterproductive - it doesn't
+    # actually free memory (same pool) and adds hook overhead. Keep model resident.
     resolved_offload_mode = offload_mode
     if resolved_offload_mode == "auto":
-        resolved_offload_mode = "model" if str(device) == "mps" else "none"
+        # MPS: don't use cpu offload (unified memory). CUDA: optionally use it.
+        resolved_offload_mode = "none" if str(device) == "mps" else "none"
 
     if resolved_offload_mode == "model":
-        print("Enabling model CPU offload...")
-        pipe.enable_model_cpu_offload()
+        print("Enabling model CPU offload (CUDA only)...")
+        if str(device) != "mps":
+            pipe.enable_model_cpu_offload()
+        else:
+            print("  Skipping on MPS (unified memory - no benefit)")
+            pipe.to(device)
     elif resolved_offload_mode == "sequential":
         print("Enabling sequential CPU offload (lowest memory, slowest)...")
-        pipe.enable_sequential_cpu_offload()
+        if str(device) != "mps":
+            pipe.enable_sequential_cpu_offload()
+        else:
+            print("  Skipping on MPS (unified memory - no benefit)")
+            pipe.to(device)
     else:
         # Standard fully-resident mode
         pipe.to(device)
@@ -185,6 +223,7 @@ def run_object_removal(
     height, width = _round_to_vae_grid(height, width, pipe.vae_spatial_compression_ratio)
 
     # 4) Load video + mask.
+    # NOTE: load_video returns list of PIL images. We'll clear these after creating conditions.
     raw_video = load_video(video_path)
     raw_mask = load_video(mask_path)
 
@@ -192,64 +231,35 @@ def run_object_removal(
         raw_video = raw_video[:num_frames]
         raw_mask = raw_mask[:num_frames]
 
+    print(f"Loaded {len(raw_video)} video frames, {len(raw_mask)} mask frames")
+
     condition1 = LTXVideoCondition(video=raw_video, frame_index=0)
     condition2 = LTXVideoCondition(video=raw_mask, frame_index=0)
+    
+    # Store frame count before clearing raw data
+    video_num_frames = len(raw_video)
+    
+    # Clear raw frame data - conditions hold copies, we don't need originals.
+    del raw_video, raw_mask
+    clear_memory()
 
     generator = get_generator(seed, device=device)
 
-    # 5) Prompt embeddings (either from cache or computed once).
-    prompt_kwargs = {}
-    if use_prompt_cache:
-        if prompt_tensors_cpu is None:
-            # Compute embeddings once using the loaded text encoder.
-            if pipe.text_encoder is None or pipe.tokenizer is None:
-                raise RuntimeError(
-                    "Prompt cache miss, but pipeline was loaded without text encoder. "
-                    "Re-run without --use_prompt_cache once, or allow loading text encoder."
-                )
+    # 5) Prompt embeddings (always precomputed before video model load).
+    if prompt_tensors_cpu is None:
+        raise RuntimeError("Prompt tensors are missing before video model run.")
 
-            pe, pam, ne, nam = pipe.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                # Guidance is used by default in OmnimatteZero (guidance_scale=3).
-                # We explicitly request the negative embeddings to make caching stable.
-                do_classifier_free_guidance=True,
-                num_videos_per_prompt=1,
-                device=pipe._execution_device,
-                max_sequence_length=max_sequence_length,
-            )
-            prompt_tensors_cpu = {
-                "prompt_embeds": pe,
-                "prompt_attention_mask": pam,
-                "negative_prompt_embeds": ne,
-                "negative_prompt_attention_mask": nam,
-            }
-            if prompt_cache_path is not None:
-                save_prompt_cache(prompt_cache_path, prompt_tensors_cpu)
-                print(f"Saved prompt embeddings cache: {os.path.basename(prompt_cache_path)}")
-
-            # Free T5 encoder/tokenizer ASAP to reduce memory footprint.
-            pipe.text_encoder = None
-            pipe.tokenizer = None
-            clear_memory()
-
-        prompt_tensors_cpu = normalize_cached_prompt_tensors(prompt_tensors_cpu, require_negative=True)
-        prompt_tensors = move_prompt_cache_to_device(prompt_tensors_cpu, device=device, dtype=dtype)
-        prompt_kwargs = {
-            "prompt": None,
-            "negative_prompt": None,
-            "prompt_embeds": prompt_tensors.get("prompt_embeds"),
-            "prompt_attention_mask": prompt_tensors.get("prompt_attention_mask"),
-            "negative_prompt_embeds": prompt_tensors.get("negative_prompt_embeds"),
-            "negative_prompt_attention_mask": prompt_tensors.get("negative_prompt_attention_mask"),
-            "max_sequence_length": max_sequence_length,
-        }
-    else:
-        prompt_kwargs = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "max_sequence_length": max_sequence_length,
-        }
+    prompt_tensors_cpu = normalize_cached_prompt_tensors(prompt_tensors_cpu, require_negative=True)
+    prompt_tensors = move_prompt_cache_to_device(prompt_tensors_cpu, device=device, dtype=dtype)
+    prompt_kwargs = {
+        "prompt": None,
+        "negative_prompt": None,
+        "prompt_embeds": prompt_tensors.get("prompt_embeds"),
+        "prompt_attention_mask": prompt_tensors.get("prompt_attention_mask"),
+        "negative_prompt_embeds": prompt_tensors.get("negative_prompt_embeds"),
+        "negative_prompt_attention_mask": prompt_tensors.get("negative_prompt_attention_mask"),
+        "max_sequence_length": max_sequence_length,
+    }
 
     # 6) Run inpainting / object removal.
     print("Running diffusion...")
@@ -257,7 +267,7 @@ def run_object_removal(
         conditions=[condition1, condition2],
         width=width,
         height=height,
-        num_frames=len(raw_video),
+        num_frames=video_num_frames,
         num_inference_steps=num_inference_steps,
         generator=generator,
         output_type="pil",
@@ -296,7 +306,7 @@ def main():
                         default="worst quality, inconsistent motion, blurry, jittery, distorted",
                         help="Negative prompt")
 
-    parser.add_argument("--use_prompt_cache", action="store_true", help="Cache and reuse T5 prompt embeddings")
+    parser.add_argument("--no_prompt_cache", action="store_true", help="Disable prompt cache file reuse/save (still uses T5-only pre-encoding)")
     parser.add_argument("--max_sequence_length", type=int, default=256, help="Max sequence length for T5")
     parser.add_argument(
         "--offload",
@@ -322,7 +332,7 @@ def main():
         seed=args.seed,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        use_prompt_cache=args.use_prompt_cache,
+        use_prompt_cache=not args.no_prompt_cache,
         max_sequence_length=args.max_sequence_length,
         offload_mode=args.offload,
     )

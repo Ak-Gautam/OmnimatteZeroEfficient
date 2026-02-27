@@ -91,15 +91,30 @@ def get_generator(seed: int = 0, device: Optional[torch.device] = None) -> torch
     return torch.Generator(device=gen_device).manual_seed(seed)
 
 
-def clear_memory():
-    """Aggressively clear GPU/MPS and CPU memory."""
-    gc.collect()
+def clear_memory(force_gc_cycles: int = 3):
+    """Aggressively clear GPU/MPS and CPU memory.
+    
+    On MPS (unified memory), proper cleanup order is critical:
+    1. Delete Python references (via gc.collect multiple times)
+    2. Synchronize to ensure all MPS ops complete
+    3. Empty the MPS memory cache
+    
+    Args:
+        force_gc_cycles: Number of gc.collect() calls (default 3 for thorough cleanup)
+    """
+    # Multiple GC cycles to handle reference chains and weak references
+    for _ in range(force_gc_cycles):
+        gc.collect()
+    
     if torch.cuda.is_available():
+        torch.cuda.synchronize()  # Sync BEFORE empty_cache
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
     elif torch.backends.mps.is_available():
+        torch.mps.synchronize()  # Sync BEFORE empty_cache - critical for MPS!
         torch.mps.empty_cache()
-        torch.mps.synchronize()
+    
+    # Final GC pass after cache clear
+    gc.collect()
 
 
 def synchronize():

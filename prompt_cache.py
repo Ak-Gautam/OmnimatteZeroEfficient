@@ -19,10 +19,14 @@ import glob
 import hashlib
 import json
 import os
+import gc
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
+
+
+T5_ENCODER_REPO = "Lightricks/LTX-Video"
 
 
 def _stable_json_dumps(obj: Any) -> str:
@@ -169,4 +173,92 @@ def move_prompt_cache_to_device(
             out[k] = v.to(device=device, dtype=dtype)
         else:
             out[k] = v.to(device=device)
+    return out
+
+
+@torch.no_grad()
+def encode_prompts_with_t5_only(
+    *,
+    prompt: str,
+    negative_prompt: Optional[str],
+    max_sequence_length: int,
+    num_videos_per_prompt: int,
+    dtype: torch.dtype,
+    cache_dir: Optional[str],
+    device: torch.device,
+    do_classifier_free_guidance: bool,
+) -> Dict[str, torch.Tensor]:
+    """Encode prompts using only T5 tokenizer+encoder (no video model).
+
+    Returns CPU tensors suitable for save_prompt_cache().
+    """
+    from transformers import T5EncoderModel, T5TokenizerFast
+
+    tokenizer = T5TokenizerFast.from_pretrained(
+        T5_ENCODER_REPO,
+        subfolder="tokenizer",
+        cache_dir=cache_dir,
+    )
+    text_encoder = T5EncoderModel.from_pretrained(
+        T5_ENCODER_REPO,
+        subfolder="text_encoder",
+        torch_dtype=dtype,
+        cache_dir=cache_dir,
+    )
+    text_encoder = text_encoder.to(device)
+    text_encoder.eval()
+
+    def _encode_one(texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        text_inputs = tokenizer(
+            texts,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        input_ids = text_inputs.input_ids.to(device)
+        attention_mask = text_inputs.attention_mask.bool().to(device)
+
+        prompt_embeds = text_encoder(input_ids, attention_mask=attention_mask)[0]
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+
+        batch_size, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+
+        attention_mask = attention_mask.view(batch_size, -1)
+        attention_mask = attention_mask.repeat(num_videos_per_prompt, 1)
+
+        return prompt_embeds, attention_mask
+
+    prompt_list = [prompt]
+    prompt_embeds, prompt_attention_mask = _encode_one(prompt_list)
+
+    negative_prompt_embeds = None
+    negative_prompt_attention_mask = None
+    if do_classifier_free_guidance:
+        negative_text = "" if negative_prompt is None else negative_prompt
+        negative_list = [negative_text]
+        negative_prompt_embeds, negative_prompt_attention_mask = _encode_one(negative_list)
+
+    out: Dict[str, torch.Tensor] = {
+        "prompt_embeds": prompt_embeds.detach().to("cpu"),
+        "prompt_attention_mask": prompt_attention_mask.detach().to("cpu"),
+    }
+    if negative_prompt_embeds is not None:
+        out["negative_prompt_embeds"] = negative_prompt_embeds.detach().to("cpu")
+    if negative_prompt_attention_mask is not None:
+        out["negative_prompt_attention_mask"] = negative_prompt_attention_mask.detach().to("cpu")
+
+    del text_encoder
+    del tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+        torch.mps.synchronize()
+
     return out

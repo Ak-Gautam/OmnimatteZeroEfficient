@@ -75,12 +75,20 @@ class OmnimatteZero(LTXConditionPipeline):
             condition_latents = self._normalize_latents(
                 condition_latents, self.vae.latents_mean, self.vae.latents_std
             ).to(device, dtype=dtype)
-
+            
+            # MEMORY: Delete raw conditioning video after encoding
+            del data
+            
             mask[mask < 0] = 0
             mask[mask > 0] = 100
             mask_latents = retrieve_latents(self.vae.encode(mask), generator=generator)
             conditioning_mask_shape = torch.logical_or(mask_latents[0].mean(0) > 0.01,mask_latents[0].mean(0) < -0.01)
             conditioning_mask_shape = conditioning_mask_shape.type(dtype).unsqueeze(0).unsqueeze(0)
+            
+            # MEMORY: Delete mask after encoding, and intermediate mask_latents after use
+            del mask
+            del mask_latents
+            
             num_cond_frames = condition_latents.size(2)
 
             latents[:, :, :num_cond_frames] = torch.lerp(
@@ -306,6 +314,21 @@ class OmnimatteZero(LTXConditionPipeline):
             device=device,
             dtype=prompt_embeds.dtype,
         )
+        
+        # MEMORY: Clear conditioning tensors after latent preparation
+        # These large video tensors are no longer needed after VAE encoding
+        if conditioning_tensors:
+            for ct in conditioning_tensors:
+                del ct
+            conditioning_tensors.clear()
+            import gc
+            gc.collect()
+            if torch.backends.mps.is_available():
+                torch.mps.synchronize()
+                torch.mps.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
         video_coords = video_coords.float()
         video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)

@@ -385,6 +385,7 @@ class SelfAttentionMapExtraction:
 
         # Binarize mask
         mask_binary = (mask_tensor.mean(dim=1, keepdim=True) > 0).float()
+        del mask_tensor  # Free original mask tensor
 
         B, C, T, H, W = video_tensor.shape
 
@@ -397,6 +398,10 @@ class SelfAttentionMapExtraction:
             prompt_embeds=self._prompt_embeds,
             prompt_attention_mask=self._prompt_attention_mask,
         )
+        
+        # Free video tensor after extraction - no longer needed (also mask_binary is smaller)
+        del video_tensor
+        
         num_latent_frames, latent_height, latent_width = latent_dims
         spatial_size = latent_height * latent_width
 
@@ -448,9 +453,13 @@ class SelfAttentionMapExtraction:
             frame_effects = frame_effects_sum / (len(attention_maps) + 1e-8)
             frame_effects = frame_effects.view(B, latent_height, latent_width)
             per_frame_effects.append(frame_effects)
+        
+        # Free attention maps and mask after processing
+        del attention_maps, mask_latent_all, mask_binary
 
         # Stack per-frame effects
         effects_latent = torch.stack(per_frame_effects, dim=1)
+        del per_frame_effects  # Free list after stacking
 
         # Upsample spatially
         effects_spatial = F.interpolate(
@@ -646,13 +655,14 @@ if __name__ == "__main__":
                         help="Memory preset (affects defaults, mainly for MPS)")
     parser.add_argument("--prompt", type=str, default="",
                         help="Prompt used when encoding for attention extraction")
-    parser.add_argument("--use_prompt_cache", action="store_true",
-                        help="Cache and reuse T5 prompt embeddings")
+    parser.add_argument("--no_prompt_cache", action="store_true",
+                        help="Disable prompt cache file reuse/save (still uses T5-only pre-encoding)")
     args = parser.parse_args()
 
     from device_utils import DEFAULT_CHECKPOINT, get_device, get_optimal_dtype, clear_memory, load_pipeline
     from prompt_cache import (
         build_prompt_cache_key,
+        encode_prompts_with_t5_only,
         find_legacy_prompt_cache,
         get_prompt_cache_path,
         load_prompt_cache,
@@ -668,44 +678,58 @@ if __name__ == "__main__":
     prompt_embeds = None
     prompt_attention_mask = None
 
-    # Load cached embeddings (if requested)
-    if args.use_prompt_cache:
-        project_root = os.path.dirname(os.path.abspath(__file__))
-        cache_dir = os.path.join(project_root, "cached_embeddings")
-        cache_key = build_prompt_cache_key(
-            prompt=args.prompt,
-            negative_prompt=None,
-            checkpoint_path=checkpoint,
-            max_sequence_length=256,
-            num_videos_per_prompt=1,
-            dtype=dtype,
-        )
-        cache_path = get_prompt_cache_path(cache_dir, cache_key)
+    use_prompt_cache = not args.no_prompt_cache
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(project_root, "cached_embeddings")
+    cache_key = build_prompt_cache_key(
+        prompt=args.prompt,
+        negative_prompt=None,
+        checkpoint_path=checkpoint,
+        max_sequence_length=256,
+        num_videos_per_prompt=1,
+        dtype=dtype,
+    )
+    cache_path = get_prompt_cache_path(cache_dir, cache_key)
+
+    cached = None
+    if use_prompt_cache:
         if os.path.exists(cache_path):
             cached = load_prompt_cache(cache_path)
-            cached = normalize_cached_prompt_tensors(cached, require_negative=False)
-            moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
-            prompt_embeds = moved.get("prompt_embeds")
-            prompt_attention_mask = moved.get("prompt_attention_mask")
             print(f"Loaded prompt cache: {os.path.basename(cache_path)}")
         else:
             legacy_path = find_legacy_prompt_cache(cache_dir, args.prompt)
             if legacy_path is not None:
                 cached = load_prompt_cache(legacy_path)
-                cached = normalize_cached_prompt_tensors(cached, require_negative=False)
-                moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
-                prompt_embeds = moved.get("prompt_embeds")
-                prompt_attention_mask = moved.get("prompt_attention_mask")
                 print(f"Prompt cache miss for keyed file; using legacy cache: {os.path.basename(legacy_path)}")
-            else:
-                print("Prompt cache miss; will compute and save embeddings.")
+
+    if cached is None:
+        print("Prompt cache miss; loading T5 encoder only to compute embeddings...")
+        cached = encode_prompts_with_t5_only(
+            prompt=args.prompt,
+            negative_prompt=None,
+            max_sequence_length=256,
+            num_videos_per_prompt=1,
+            dtype=dtype,
+            cache_dir=args.cache_dir,
+            device=device,
+            do_classifier_free_guidance=False,
+        )
+        if use_prompt_cache:
+            save_prompt_cache(cache_path, cached)
+            print(f"Saved prompt cache: {os.path.basename(cache_path)}")
+        clear_memory()
+
+    cached = normalize_cached_prompt_tensors(cached, require_negative=False)
+    moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
+    prompt_embeds = moved.get("prompt_embeds")
+    prompt_attention_mask = moved.get("prompt_attention_mask")
 
     print("Loading pipeline...")
     pipe = load_pipeline(
         checkpoint_path=checkpoint,
         cache_dir=args.cache_dir,
         dtype=dtype,
-        load_text_encoder=prompt_embeds is None,
+        load_text_encoder=False,
         force_vae_fp32=True,
     )
 
@@ -722,36 +746,8 @@ if __name__ == "__main__":
     pipe.to(device)
     clear_memory()
 
-    # Compute embeddings if needed, then optionally save and free the text encoder
-    if args.use_prompt_cache and prompt_embeds is None:
-        pe, pam, _, _ = pipe.encode_prompt(
-            prompt=args.prompt,
-            negative_prompt=None,
-            do_classifier_free_guidance=False,
-            num_videos_per_prompt=1,
-            device=pipe._execution_device,
-            max_sequence_length=256,
-        )
-        prompt_embeds = pe.to(device=device, dtype=dtype)
-        prompt_attention_mask = pam.to(device=device)
-
-        project_root = os.path.dirname(os.path.abspath(__file__))
-        cache_dir = os.path.join(project_root, "cached_embeddings")
-        cache_key = build_prompt_cache_key(
-            prompt=args.prompt,
-            negative_prompt=None,
-            checkpoint_path=checkpoint,
-            max_sequence_length=256,
-            num_videos_per_prompt=1,
-            dtype=dtype,
-        )
-        cache_path = get_prompt_cache_path(cache_dir, cache_key)
-        save_prompt_cache(cache_path, {"prompt_embeds": pe, "prompt_attention_mask": pam})
-        print(f"Saved prompt cache: {os.path.basename(cache_path)}")
-
-        pipe.text_encoder = None
-        pipe.tokenizer = None
-        clear_memory()
+    if prompt_embeds is None:
+        raise RuntimeError("Prompt embeddings are missing before video model run.")
 
     generate_total_mask_for_folder(
         pipe,
