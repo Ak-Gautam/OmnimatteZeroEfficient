@@ -74,23 +74,29 @@ Remove an object and its effects (shadows, reflections) from a video.
 ### Usage
 
 ```bash
-python object_removal.py
+# Apple Silicon (MPS) recommended profile: 704x480, 97 frames
+python object_removal.py --preset mps_24gb --video swan_lake --height 480 --width 704 --num_frames 97 --use_prompt_cache
+
+# Lower memory on Apple Silicon (recommended)
+python object_removal.py --preset mps_24gb --video swan_lake --height 480 --width 704 --num_frames 97 --use_prompt_cache --offload model
+
+# Minimum peak memory (slowest)
+python object_removal.py --preset mps_24gb --video swan_lake --height 480 --width 704 --num_frames 97 --use_prompt_cache --offload sequential
+
+# Any folder under example_videos/
+python object_removal.py --preset mps_24gb --video cat_reflection --use_prompt_cache
 ```
 
 ### Configuration
 
-Edit the following parameters in `object_removal.py`:
+Main CLI options:
 
-```python
-# Input directory containing video folders
-base_dir = "example_videos"
-
-# Output resolution
-expected_height, expected_width = 512, 768
-
-# Generation parameters
-num_inference_steps = 30  # More steps = higher quality but slower
-```
+- `--video` folder name under `example_videos/` (or explicit folder path)
+- `--checkpoint` local model file (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`)
+- `--height --width --num_frames` (M4 Pro target: `480 704 97`)
+- `--use_prompt_cache` caches prompt embeddings to `cached_embeddings/` and skips loading T5 on later runs
+- `--num_inference_steps` controls quality/speed tradeoff
+- `--offload` controls CPU offload mode (`auto|none|model|sequential`)
 
 ### How it works
 
@@ -112,7 +118,7 @@ results/
 If you only have the object_mask, you can automatically generate total_mask using self-attention:
 
 ```bash
-python self_attention_map.py --video_folder ./example_videos/your_video_name
+python self_attention_map.py --video_folder ./example_videos/your_video_name --height 480 --width 704 --preset mps_24gb --use_prompt_cache
 ```
 
 This uses the diffusion model's self-attention to find regions that are semantically related to the object (like shadows and reflections).
@@ -192,23 +198,18 @@ Before running, you need:
 ### Usage
 
 ```bash
-python foreground_composition.py
+python foreground_composition.py --video_folder swan_lake --new_bg ./results/cat_reflection.mp4 --height 480 --width 704 --use_prompt_cache
 ```
 
 ### Configuration
 
-Edit the following parameters in `foreground_composition.py`:
+Main CLI options:
 
-```python
-# Output resolution
-w, h = 768, 512
-
-# Video folder name
-video_folder = "swan_lake"
-
-# New background to compose onto
-video_new_bg = load_video("./results/cat_reflection.mp4")
-```
+- `--video_folder` source folder under `example_videos/`
+- `--new_bg` path to the replacement background video
+- `--checkpoint` local model file (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`)
+- `--height --width` output size (M4 Pro target: `480 704`)
+- `--use_prompt_cache` for refinement stage text-conditioning reuse
 
 ### How it works
 
@@ -224,9 +225,9 @@ video_new_bg = load_video("./results/cat_reflection.mp4")
 Results are saved to `results/`:
 ```
 results/
-├── foreground.mp4       # Extracted foreground layer
-├── latent_addition.mp4  # Latent addition result (before refinement)
-└── refinement.mp4       # Final refined composition
+├── <video_folder>_foreground.mp4       # Extracted foreground layer
+├── <video_folder>_latent_addition.mp4  # Latent addition result (before refinement)
+└── <video_folder>_refined.mp4          # Final refined composition
 ```
 
 

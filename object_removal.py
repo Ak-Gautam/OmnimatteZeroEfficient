@@ -80,6 +80,7 @@ def run_object_removal(
     negative_prompt: str,
     use_prompt_cache: bool,
     max_sequence_length: int,
+    offload_mode: str,
 ):
     device = get_device()
     dtype = get_optimal_dtype()  # float16 on MPS
@@ -162,9 +163,20 @@ def run_object_removal(
         pipe.enable_vae_slicing()
     pipe.vae.enable_tiling()
 
-    # Move to device (note: if you later decide to use diffusers CPU offload hooks,
-    # they should be enabled *instead of* this explicit .to(device))
-    pipe.to(device)
+    # CPU offload configuration (effective on Apple Silicon to reduce MPS residency).
+    resolved_offload_mode = offload_mode
+    if resolved_offload_mode == "auto":
+        resolved_offload_mode = "model" if str(device) == "mps" else "none"
+
+    if resolved_offload_mode == "model":
+        print("Enabling model CPU offload...")
+        pipe.enable_model_cpu_offload()
+    elif resolved_offload_mode == "sequential":
+        print("Enabling sequential CPU offload (lowest memory, slowest)...")
+        pipe.enable_sequential_cpu_offload()
+    else:
+        # Standard fully-resident mode
+        pipe.to(device)
 
     clear_memory()
     print_memory_stats()
@@ -286,6 +298,13 @@ def main():
 
     parser.add_argument("--use_prompt_cache", action="store_true", help="Cache and reuse T5 prompt embeddings")
     parser.add_argument("--max_sequence_length", type=int, default=256, help="Max sequence length for T5")
+    parser.add_argument(
+        "--offload",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "model", "sequential"],
+        help="CPU offload mode: auto(model on MPS), none, model, sequential",
+    )
 
     args = parser.parse_args()
 
@@ -305,6 +324,7 @@ def main():
         negative_prompt=args.negative_prompt,
         use_prompt_cache=args.use_prompt_cache,
         max_sequence_length=args.max_sequence_length,
+        offload_mode=args.offload,
     )
 
 

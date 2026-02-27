@@ -304,7 +304,7 @@ class OmnimatteZero(LTXConditionPipeline):
             latents=latents,
             generator=generator,
             device=device,
-            dtype=torch.float32,
+            dtype=prompt_embeds.dtype,
         )
 
         video_coords = video_coords.float()
