@@ -5,20 +5,11 @@ from diffusers.image_processor import PipelineImageInput
 from diffusers.pipelines.ltx.pipeline_ltx_condition import retrieve_latents, LTXVideoCondition, \
     linear_quadratic_schedule, retrieve_timesteps
 from diffusers.pipelines.ltx.pipeline_output import LTXPipelineOutput
-from diffusers.utils import is_torch_xla_available
 from diffusers.utils.torch_utils import randn_tensor
 import torch
 import torch.nn.functional as F
 
-# XLA support (optional, for TPU acceleration)
-try:
-    if is_torch_xla_available():
-        import torch_xla.core.xla_model as xm
-        XLA_AVAILABLE = True
-    else:
-        XLA_AVAILABLE = False
-except Exception:
-    XLA_AVAILABLE = False
+from device_utils import clear_memory
 
 
 class OmnimatteZero(LTXConditionPipeline):
@@ -57,38 +48,30 @@ class OmnimatteZero(LTXConditionPipeline):
         else:
             latents = noise.clone()
 
+        extra_conditioning_num_latents = 0
+
         if len(conditions) > 0:
             condition_latent_frames_mask = torch.zeros(
                 (batch_size, num_latent_frames), device=device, dtype=torch.float32
             )
 
-            extra_conditioning_latents = []
-            extra_conditioning_video_ids = []
-            extra_conditioning_mask = []
-            extra_conditioning_num_latents = 0
-
-            data, mask, strength, frame_index = conditions[0], conditions[1], condition_strength[0], \
-            condition_frame_index[0]
-            # for data, strength, frame_index in zip(conditions, condition_strength, condition_frame_index):
+            data, mask, strength, frame_index = (
+                conditions[0], conditions[1], condition_strength[0], condition_frame_index[0]
+            )
             condition_latents = retrieve_latents(self.vae.encode(data), generator=generator)
-            print(condition_latents.shape)
             condition_latents = self._normalize_latents(
                 condition_latents, self.vae.latents_mean, self.vae.latents_std
             ).to(device, dtype=dtype)
-            
-            # MEMORY: Delete raw conditioning video after encoding
             del data
-            
+
             mask[mask < 0] = 0
             mask[mask > 0] = 100
             mask_latents = retrieve_latents(self.vae.encode(mask), generator=generator)
-            conditioning_mask_shape = torch.logical_or(mask_latents[0].mean(0) > 0.01,mask_latents[0].mean(0) < -0.01)
+            conditioning_mask_shape = torch.logical_or(mask_latents[0].mean(0) > 0.01, mask_latents[0].mean(0) < -0.01)
             conditioning_mask_shape = conditioning_mask_shape.type(dtype).unsqueeze(0).unsqueeze(0)
-            
-            # MEMORY: Delete mask after encoding, and intermediate mask_latents after use
             del mask
             del mask_latents
-            
+
             num_cond_frames = condition_latents.size(2)
 
             latents[:, :, :num_cond_frames] = torch.lerp(
@@ -108,7 +91,7 @@ class OmnimatteZero(LTXConditionPipeline):
         if len(conditions) > 0:
             conditioning_mask = (1 - conditioning_mask_shape[0].reshape(1, -1))
         else:
-            conditioning_mask, extra_conditioning_num_latents = None, 0
+            conditioning_mask = None
         video_ids = self._scale_video_ids(
             video_ids,
             scale_factor=self.vae_spatial_compression_ratio,
@@ -122,11 +105,6 @@ class OmnimatteZero(LTXConditionPipeline):
         latents = self._pack_latents(
             latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
         )
-
-        if len(conditions) > 0 and len(extra_conditioning_latents) > 0:
-            latents = torch.cat([*extra_conditioning_latents, latents], dim=1)
-            video_ids = torch.cat([*extra_conditioning_video_ids, video_ids], dim=2)
-            conditioning_mask = torch.cat([*extra_conditioning_mask, conditioning_mask], dim=1)
 
         return latents, conditioning_mask, video_ids, extra_conditioning_num_latents
 
@@ -168,7 +146,6 @@ class OmnimatteZero(LTXConditionPipeline):
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
-        # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt=prompt,
             conditions=conditions,
@@ -191,7 +168,6 @@ class OmnimatteZero(LTXConditionPipeline):
         self._interrupt = False
         self._current_timestep = None
 
-        # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -227,7 +203,6 @@ class OmnimatteZero(LTXConditionPipeline):
         device = self._execution_device
         vae_dtype = self.vae.dtype
 
-        # 3. Prepare text embeddings & conditioning image/video
         (
             prompt_embeds,
             prompt_attention_mask,
@@ -245,10 +220,6 @@ class OmnimatteZero(LTXConditionPipeline):
             max_sequence_length=max_sequence_length,
             device=device,
         )
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-
         conditioning_tensors = []
         is_conditioning_image_or_video = image is not None or video is not None
         if is_conditioning_image_or_video:
@@ -279,7 +250,6 @@ class OmnimatteZero(LTXConditionPipeline):
                     )
                 conditioning_tensors.append(condition_tensor)
 
-        # 4. Prepare timesteps
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
         latent_height = height // self.vae_spatial_compression_ratio
         latent_width = width // self.vae_spatial_compression_ratio
@@ -297,7 +267,6 @@ class OmnimatteZero(LTXConditionPipeline):
 
         self._num_timesteps = len(timesteps)
 
-        # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
         latents, conditioning_mask, video_coords, extra_conditioning_num_latents = self.my_prepare_latents(
             conditioning_tensors,
@@ -314,31 +283,20 @@ class OmnimatteZero(LTXConditionPipeline):
             device=device,
             dtype=prompt_embeds.dtype,
         )
-        
-        # MEMORY: Clear conditioning tensors after latent preparation
-        # These large video tensors are no longer needed after VAE encoding
+
+        # Clear conditioning tensors after latent preparation (no longer needed)
         if conditioning_tensors:
             for ct in conditioning_tensors:
                 del ct
             conditioning_tensors.clear()
-            import gc
-            gc.collect()
-            if torch.backends.mps.is_available():
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
-            elif torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+            clear_memory()
 
         video_coords = video_coords.float()
         video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
 
         init_latents = latents.clone() if is_conditioning_image_or_video else None
 
-        if self.do_classifier_free_guidance:
-            video_coords = torch.cat([video_coords, video_coords], dim=0)
-
-        # 6. Denoising loop
+        # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -347,8 +305,6 @@ class OmnimatteZero(LTXConditionPipeline):
                 self._current_timestep = t
 
                 if image_cond_noise_scale > 0 and init_latents is not None:
-                    # Add timestep-dependent noise to the hard-conditioning latents
-                    # This helps with motion continuity, especially when conditioned on a single frame
                     latents = self.add_noise_to_image_conditioning_latents(
                         t / 1000.0,
                         init_latents,
@@ -358,34 +314,47 @@ class OmnimatteZero(LTXConditionPipeline):
                         generator,
                     )
 
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                if is_conditioning_image_or_video:
-                    conditioning_mask_model_input = (
-                        torch.cat([conditioning_mask, conditioning_mask])
-                        if self.do_classifier_free_guidance
-                        else conditioning_mask
-                    )
-                latent_model_input = latent_model_input.to(prompt_embeds.dtype)
+                latent_model_input = latents.to(prompt_embeds.dtype)
 
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0]).unsqueeze(-1).float()
+                timestep = t.expand(latents.shape[0]).unsqueeze(-1).float()
                 if is_conditioning_image_or_video:
-                    timestep = torch.min(timestep, (1 - conditioning_mask_model_input) * 1000.0)
-
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep,
-                    encoder_attention_mask=prompt_attention_mask,
-                    video_coords=video_coords,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
+                    timestep = torch.min(timestep, (1 - conditioning_mask) * 1000.0)
 
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    # Sequential CFG: two batch_size=1 passes instead of one batch_size=2
+                    # Halves peak activation memory (critical for MPS attention matrices)
+                    noise_pred_uncond = self.transformer(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        timestep=timestep,
+                        encoder_attention_mask=negative_prompt_attention_mask,
+                        video_coords=video_coords,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                    )[0]
+
+                    noise_pred_text = self.transformer(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timestep,
+                        encoder_attention_mask=prompt_attention_mask,
+                        video_coords=video_coords,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                    )[0]
+
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    timestep, _ = timestep.chunk(2)
+                    del noise_pred_uncond, noise_pred_text
+                else:
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timestep,
+                        encoder_attention_mask=prompt_attention_mask,
+                        video_coords=video_coords,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 denoised_latents = self.scheduler.step(
                     -noise_pred, t, latents, per_token_timesteps=timestep, return_dict=False
@@ -405,12 +374,8 @@ class OmnimatteZero(LTXConditionPipeline):
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
-                if XLA_AVAILABLE:
-                    xm.mark_step()
 
         if is_conditioning_image_or_video:
             latents = latents[:, extra_conditioning_num_latents:]
@@ -423,6 +388,11 @@ class OmnimatteZero(LTXConditionPipeline):
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
+
+        # Free transformer weights (~3.7 GB) before VAE decode.
+        # Safe because the denoising loop is complete and only VAE is needed below.
+        self.transformer = None
+        clear_memory()
 
         if output_type == "latent":
             video = latents
@@ -452,7 +422,6 @@ class OmnimatteZero(LTXConditionPipeline):
             video = self.vae.decode(latents, timestep, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
 
-        # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:

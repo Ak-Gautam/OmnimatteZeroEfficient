@@ -37,11 +37,10 @@ The original OmnimatteZero requires a 32 GB+ CUDA GPU. This project makes it pra
 - **MPS backend support** — runs natively on Apple M-series GPUs via PyTorch MPS
 - **Unified memory-aware configuration** — tuned for the ~65% of unified memory actually available to ML workloads after macOS overhead
 - **Prompt embedding cache** — caches T5 encoder outputs to disk, so repeat runs skip the expensive text encoder entirely
-- **Tiered memory presets** — pre-configured profiles for `mps_24gb`, `16gb`, `24gb`, and `32gb` VRAM targets
-- **Attention slicing** — critical for MPS memory constraints
-- **Model CPU offload** — leverages unified memory architecture for efficient offloading
+- **Head-sliced attention** — chunks SDPA over attention heads to reduce peak memory (diffusers' built-in attention slicing is a no-op for LTX-Video)
+- **Sequential classifier-free guidance** — runs negative/positive prompts in separate passes to halve peak activation memory
+- **Direct MPS loading** — avoids the 2x memory spike from CPU offload transitions on unified memory
 - **VAE float32 enforcement** — prevents numerical instability on MPS/FP16
-- **Cross-platform device abstraction** — auto-detects CUDA, MPS, or CPU and applies the right dtypes and generator handling
 
 All three pipeline stages work on Apple Silicon: object removal, self-attention mask generation, and foreground composition.
 
@@ -52,7 +51,6 @@ All three pipeline stages work on Apple Silicon: object removal, self-attention 
 - Python 3.8+
 - PyTorch 2.4+
 - Apple Silicon Mac with 24 GB unified memory (M4 Pro, M4 Max, M3 Pro, M3 Max, etc.)
-  - Also works on CUDA GPUs (16 GB+ VRAM)
 - ~6 GB disk space for the LTX-Video 2B model checkpoint
 
 ## Installation
@@ -99,39 +97,9 @@ Generate masks with [SAM2](https://github.com/facebookresearch/segment-anything-
 Remove an object and its associated effects (shadows, reflections) from a video.
 
 ```bash
-# Apple Silicon (recommended)
 python object_removal.py \
-  --preset mps_24gb \
   --video three_swans_lake \
-  --height 480 --width 704 --num_frames 97 \
   --use_prompt_cache
-
-# With model CPU offload (lower peak memory)
-python object_removal.py \
-  --preset mps_24gb \
-  --video three_swans_lake \
-  --height 480 --width 704 --num_frames 97 \
-  --use_prompt_cache --offload model
-
-# Minimum memory (slowest)
-python object_removal.py \
-  --preset mps_24gb \
-  --video three_swans_lake \
-  --height 480 --width 704 --num_frames 97 \
-  --use_prompt_cache --offload sequential
-```
-
-**CUDA GPUs:**
-
-```bash
-# 16 GB VRAM
-python object_removal_optimized.py --preset 16gb --video three_swans_lake
-
-# 24 GB VRAM
-python object_removal_optimized.py --preset 24gb --video three_swans_lake
-
-# 32 GB+ VRAM
-python object_removal.py --preset 32gb --video three_swans_lake
 ```
 
 Output is saved to `results/<video_name>.mp4`.
@@ -141,12 +109,10 @@ Output is saved to `results/<video_name>.mp4`.
 | Flag | Description |
 |------|-------------|
 | `--video` | Folder name under `example_videos/` |
-| `--preset` | Memory preset: `mps_24gb`, `16gb`, `24gb`, `32gb` |
 | `--checkpoint` | Path to model checkpoint (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`) |
-| `--height`, `--width` | Output resolution (MPS target: 480x704) |
-| `--num_frames` | Frame count (MPS target: 97 = ~4s at 24fps) |
+| `--height`, `--width` | Output resolution (default: 480x704) |
+| `--num_frames` | Frame count (default: 97 = ~4s at 24fps) |
 | `--use_prompt_cache` | Cache T5 embeddings to `cached_embeddings/` |
-| `--offload` | CPU offload mode: `auto`, `none`, `model`, `sequential` |
 | `--num_inference_steps` | Quality/speed tradeoff (default: 30) |
 
 ---
@@ -158,19 +124,18 @@ If you only have an `object_mask.mp4`, generate the `total_mask.mp4` (object + e
 ```bash
 python self_attention_map.py \
   --video_folder ./example_videos/three_swans_lake \
-  --height 480 --width 704 \
-  --preset mps_24gb \
   --use_prompt_cache
 ```
 
-**How it works:** The video is encoded to latent space, noise is injected, and a forward pass extracts self-attention maps from all 48 transformer layers. Regions that attend strongly to the object (like its shadow or reflection) are identified and merged into the total mask.
+**How it works:** The video is encoded to latent space, noise is injected, and a forward pass extracts self-attention maps from a sample of the 48 transformer layers. Regions that attend strongly to the object (like its shadow or reflection) are identified and merged into the total mask.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--video_folder` | (required) | Folder with `video.mp4` and `object_mask.mp4` |
-| `--height`, `--width` | 512, 768 | Processing resolution |
+| `--height`, `--width` | 480, 704 | Processing resolution |
 | `--threshold` | adaptive | Attention threshold (`None` = mean + 0.5*std) |
 | `--dilation` | 3 | Morphological dilation kernel size |
+| `--max_layers` | 4 | Number of attention layers to sample (fewer = less memory) |
 
 Output: `total_mask.mp4` is written to the input folder.
 
@@ -186,7 +151,6 @@ Extract the foreground layer and composite it onto a new background:
 python foreground_composition.py \
   --video_folder three_swans_lake \
   --new_bg ./results/cat_reflection.mp4 \
-  --height 480 --width 704 \
   --use_prompt_cache
 ```
 
@@ -196,7 +160,7 @@ python foreground_composition.py \
 2. Compute the foreground: `z_foreground = z_original - z_background`
 3. Pixel-inject the object region for fine detail preservation
 4. Add to the new background: `z_composite = z_new_bg + z_foreground`
-5. Refine with a few noising-denoising steps
+5. Refine with a few noising-denoising steps (skip with `--skip_refinement`)
 
 **Output:**
 
@@ -209,32 +173,35 @@ results/
 
 ---
 
-## Memory Presets
+## Memory Configuration
 
-| Preset | Target | Resolution | Max Frames | Notes |
-|--------|--------|------------|------------|-------|
-| `mps_24gb` | Apple Silicon 24 GB | 704x480 | 97 | Attention slicing, model CPU offload, FP16 |
-| `16gb` | CUDA 16 GB | 704x480 | 97 | FP8 casting, group offloading, sequential CPU offload |
-| `24gb` | CUDA 24 GB | 768x512 | 121 | FP8 casting, group offloading, model CPU offload |
-| `32gb` | CUDA 32 GB+ | 768x512 | 161 | VAE tiling only |
+The default configuration targets Apple Silicon with 24 GB unified memory:
 
-The `mps_24gb` preset accounts for macOS using ~35% of unified memory, leaving ~15.6 GB effective for ML workloads. It disables FP8 casting and group offloading (unsupported on MPS) and relies on attention slicing + model CPU offload instead.
+| Setting | Value |
+|---------|-------|
+| Resolution | 704x480 |
+| Max frames | 97 (~4s at 24fps) |
+| VAE tiling/slicing | Enabled |
+| Head-sliced attention | 4 heads/chunk (32 total = 8 chunks) |
+| Sequential CFG | Enabled (two batch-1 passes instead of one batch-2) |
+| Direct MPS loading | Enabled (no CPU offload transitions) |
+| Dtype | FP16 (VAE forced to FP32) |
+
+macOS uses ~35% of unified memory for the OS, leaving ~15.6 GB effective for ML workloads. The defaults are tuned for this constraint.
+
+### Why not standard diffusers optimizations?
+
+- **`enable_attention_slicing()`** is a no-op for LTX-Video — it uses its own `LTXAttention` class, not diffusers' standard `Attention`. We replace it with head-sliced attention that actually chunks SDPA over the head dimension.
+- **`enable_model_cpu_offload()`** is counterproductive on unified memory — CPU and MPS share the same physical RAM, so offloading creates a 2x peak during transitions instead of saving memory. We load directly to MPS instead.
 
 ---
 
 ## Tips
 
 - **First run is slower** — the T5 text encoder must run once. Use `--use_prompt_cache` so subsequent runs skip it entirely.
-- **Start with the preset defaults** for resolution and frame count. Increase only if you have headroom.
+- **Start with the defaults** for resolution and frame count. Increase only if you have headroom.
 - **Shorter clips** process faster and use less memory. Split long videos into segments if needed.
-- **`--offload sequential`** uses the least memory but is noticeably slower than `--offload model`.
 - **Monitor memory** on macOS with Activity Monitor or `sudo powermetrics --samplers gpu_power`.
-
----
-
-## Note on Attention Guidance
-
-The original paper describes Temporal and Spatial Attention Guidance using TAP-Net. The current codebase uses LTX-Video 0.9.5/0.9.7, which achieves good results without explicit attention guidance. The guidance implementation is available in `attention_guidance.py` for reference.
 
 ---
 
@@ -259,7 +226,6 @@ If you use this work, please cite the original paper:
 
 - [LTX-Video](https://github.com/Lightricks/LTX-Video) — base video diffusion model
 - [Diffusers](https://github.com/huggingface/diffusers) — diffusion pipeline infrastructure
-- [TAP-Net](https://github.com/google-deepmind/tapnet) — point tracking (reference)
 
 ---
 

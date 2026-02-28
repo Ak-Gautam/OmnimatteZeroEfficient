@@ -1,4 +1,4 @@
-# OmnimatteZero requirements
+# OmnimatteZero requirements (Apple Silicon / MPS)
 torch>=2.4.0
 torchvision>=0.19.0
 opencv-python>=4.9.0.80
@@ -8,13 +8,7 @@ tokenizers>=0.20.3
 accelerate>=1.1.1
 tqdm
 imageio
-easydict
-ftfy
-dashscope
 imageio-ffmpeg
-flash_attn
-gradio>=5.0.0
 numpy==1.24.4
 sentencepiece
 protobuf
-tiktoken
