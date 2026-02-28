@@ -253,12 +253,7 @@ def encode_prompts_with_t5_only(
 
     del text_encoder
     del tokenizer
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    elif torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-        torch.mps.synchronize()
+    from device_utils import clear_memory
+    clear_memory()
 
     return out
