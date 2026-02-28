@@ -1,248 +1,245 @@
-# OmnimatteZero
+# OmnimatteZeroEfficient
 
-[![Project Page](https://img.shields.io/badge/Project%20Page-website-blue)](https://dvirsamuel.github.io/omnimattezero.github.io/)
-[![Paper](https://img.shields.io/badge/arXiv-2503.18033-b31b1b.svg)](https://arxiv.org/abs/2503.18033)
+**Training-free video matting, object removal, and layer composition — optimized for Apple Silicon.**
 
-Official implementation of **OmnimatteZero: Training-Free Video Matting and Compositing via Latent Diffusion Models**
+This is a memory-optimized fork of [OmnimatteZero](https://github.com/dvirsamuel/OmnimatteZero) by Samuel et al., re-engineered to run on Apple M-series chips with ~22 GB unified memory. If you have a 24 GB MacBook Pro (M4 Pro / M4 Max), this will run out of the box — no NVIDIA GPU required.
 
-OmnimatteZero is a training-free approach for video matting, object removal, and layer composition using pre-trained video diffusion models. It leverages the powerful priors learned by video generation models to achieve high-quality results without any task-specific training.
+[![Original Paper](https://img.shields.io/badge/arXiv-2503.18033-b31b1b.svg)](https://arxiv.org/abs/2503.18033)
+[![Original Project Page](https://img.shields.io/badge/Project%20Page-OmnimatteZero-blue)](https://dvirsamuel.github.io/omnimattezero.github.io/)
+[![GitHub](https://img.shields.io/badge/GitHub-Ak--Gautam-181717?logo=github)](https://github.com/Ak-Gautam)
+[![Twitter](https://img.shields.io/badge/Twitter-@Gautam__A__k-1DA1F2?logo=x)](https://x.com/Gautam_A_k)
 
-## Features
+---
 
-- **Object Removal**: Remove objects and their effects (shadows, reflections) from videos
-- **Foreground Extraction**: Extract foreground layers with associated effects
-- **Layer Composition**: Compose extracted foreground layers onto new backgrounds
-- All operations are **training-free** and work with off-the-shelf video diffusion models
+## Example: Object Removal
+
+**Input** — three swans on a lake:
+
+https://github.com/user-attachments/assets/three_swans_lake_input
+
+https://github.com/Ak-Gautam/OmnimatteZeroEfficient/raw/main/example_videos/three_swans_lake/video.mp4
+
+**Result** — swans and their reflections cleanly removed:
+
+https://github.com/Ak-Gautam/OmnimatteZeroEfficient/raw/main/results/three_swans_lake.mp4
+
+---
+
+## What This Fork Adds
+
+The original OmnimatteZero requires a 32 GB+ CUDA GPU. This fork makes it practical on consumer Apple Silicon hardware:
+
+- **MPS backend support** — runs natively on Apple M-series GPUs via PyTorch MPS
+- **Unified memory-aware configuration** — tuned for the ~65% of unified memory actually available to ML workloads after macOS overhead
+- **Prompt embedding cache** — caches T5 encoder outputs to disk, so repeat runs skip the expensive text encoder entirely
+- **Tiered memory presets** — pre-configured profiles for `mps_24gb`, `16gb`, `24gb`, and `32gb` VRAM targets
+- **Attention slicing** — critical for MPS memory constraints
+- **Model CPU offload** — leverages unified memory architecture for efficient offloading
+- **VAE float32 enforcement** — prevents numerical instability on MPS/FP16
+- **Cross-platform device abstraction** — auto-detects CUDA, MPS, or CPU and applies the right dtypes and generator handling
+
+All three pipeline stages work on Apple Silicon: object removal, self-attention mask generation, and foreground composition.
+
+---
+
+## Requirements
+
+- Python 3.8+
+- PyTorch 2.4+
+- Apple Silicon Mac with 24 GB unified memory (M4 Pro, M4 Max, M3 Pro, M3 Max, etc.)
+  - Also works on CUDA GPUs (16 GB+ VRAM)
+- ~6 GB disk space for the LTX-Video 2B model checkpoint
 
 ## Installation
 
-### Requirements
-
-- Python 3.8+
-- CUDA-capable GPU (16GB+ VRAM with optimizations, 32GB+ recommended for full quality)
-- PyTorch 2.4+
-
-### Setup
-
 ```bash
-# Clone the repository
-git clone https://github.com/your-repo/OmnimatteZero.git
-cd OmnimatteZero
+git clone https://github.com/Ak-Gautam/OmnimatteZeroEfficient.git
+cd OmnimatteZeroEfficient
 
-# Create a virtual environment (optional but recommended)
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### Dependencies
+Download the [LTX-Video 2B v0.9.5](https://huggingface.co/Lightricks/LTX-Video) checkpoint and place it in `model_checkpoint/`:
 
-The main dependencies include:
-- `torch>=2.4.0`
-- `diffusers>=0.31.0`
-- `transformers>=4.49.0`
-- `accelerate>=1.1.1`
+```
+model_checkpoint/
+└── ltx-video-2b-v0.9.5.safetensors
+```
+
+---
 
 ## Quick Start
 
-### Data Preparation
+### Data Layout
 
-Your input data should be organized as follows:
+Place your input videos under `example_videos/`:
 
 ```
 example_videos/
-├── your_video_name/
-│   ├── video.mp4          # Original video with object
-│   ├── object_mask.mp4    # Mask of the object only
-│   └── total_mask.mp4     # Mask including object + effects (shadows, reflections)
+└── your_video/
+    ├── video.mp4           # original video
+    ├── object_mask.mp4     # binary mask of the object (white = object)
+    └── total_mask.mp4      # mask of object + effects (shadows, reflections)
 ```
 
-- **video.mp4**: The original input video
-- **object_mask.mp4**: Binary mask video showing only the object pixels (white = object, black = background)
-- **total_mask.mp4**: Binary mask video showing the object AND its effects (shadows, reflections, etc.)
-
-You can generate masks using [SAM2](https://github.com/facebookresearch/segment-anything-2).
+Generate masks with [SAM2](https://github.com/facebookresearch/segment-anything-2) or use the built-in self-attention mask generator (see below).
 
 ---
 
 ## Object Removal
 
-Remove an object and its effects (shadows, reflections) from a video.
-
-### Usage
+Remove an object and its associated effects (shadows, reflections) from a video.
 
 ```bash
-# Apple Silicon (MPS) recommended profile: 704x480, 97 frames
-python object_removal.py --preset mps_24gb --video swan_lake --height 480 --width 704 --num_frames 97 --use_prompt_cache
+# Apple Silicon (recommended)
+python object_removal.py \
+  --preset mps_24gb \
+  --video three_swans_lake \
+  --height 480 --width 704 --num_frames 97 \
+  --use_prompt_cache
 
-# Lower memory on Apple Silicon (recommended)
-python object_removal.py --preset mps_24gb --video swan_lake --height 480 --width 704 --num_frames 97 --use_prompt_cache --offload model
+# With model CPU offload (lower peak memory)
+python object_removal.py \
+  --preset mps_24gb \
+  --video three_swans_lake \
+  --height 480 --width 704 --num_frames 97 \
+  --use_prompt_cache --offload model
 
-# Minimum peak memory (slowest)
-python object_removal.py --preset mps_24gb --video swan_lake --height 480 --width 704 --num_frames 97 --use_prompt_cache --offload sequential
-
-# Any folder under example_videos/
-python object_removal.py --preset mps_24gb --video cat_reflection --use_prompt_cache
+# Minimum memory (slowest)
+python object_removal.py \
+  --preset mps_24gb \
+  --video three_swans_lake \
+  --height 480 --width 704 --num_frames 97 \
+  --use_prompt_cache --offload sequential
 ```
 
-### Configuration
-
-Main CLI options:
-
-- `--video` folder name under `example_videos/` (or explicit folder path)
-- `--checkpoint` local model file (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`)
-- `--height --width --num_frames` (M4 Pro target: `480 704 97`)
-- `--use_prompt_cache` caches prompt embeddings to `cached_embeddings/` and skips loading T5 on later runs
-- `--num_inference_steps` controls quality/speed tradeoff
-- `--offload` controls CPU offload mode (`auto|none|model|sequential`)
-
-### How it works
-
-1. Loads the original video and total mask
-2. Uses the mask to indicate regions to inpaint
-3. The diffusion model fills in the masked regions while maintaining temporal consistency
-4. Outputs a clean background video without the object
-
-### Output
-
-Results are saved to the `results/` directory:
-```
-results/
-├── video_name.mp4
-```
-
-### Generating total_mask from object_mask
-
-If you only have the object_mask, you can automatically generate total_mask using self-attention:
+**CUDA GPUs:**
 
 ```bash
-python self_attention_map.py --video_folder ./example_videos/your_video_name --height 480 --width 704 --preset mps_24gb --use_prompt_cache
+# 16 GB VRAM
+python object_removal_optimized.py --preset 16gb --video three_swans_lake
+
+# 24 GB VRAM
+python object_removal_optimized.py --preset 24gb --video three_swans_lake
+
+# 32 GB+ VRAM
+python object_removal.py --preset 32gb --video three_swans_lake
 ```
 
-This uses the diffusion model's self-attention to find regions that are semantically related to the object (like shadows and reflections).
+Output is saved to `results/<video_name>.mp4`.
 
-#### How It Works
+### Key Options
 
-The self-attention mask generation leverages the internal attention patterns of the video diffusion model:
+| Flag | Description |
+|------|-------------|
+| `--video` | Folder name under `example_videos/` |
+| `--preset` | Memory preset: `mps_24gb`, `16gb`, `24gb`, `32gb` |
+| `--checkpoint` | Path to model checkpoint (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`) |
+| `--height`, `--width` | Output resolution (MPS target: 480x704) |
+| `--num_frames` | Frame count (MPS target: 97 = ~4s at 24fps) |
+| `--use_prompt_cache` | Cache T5 embeddings to `cached_embeddings/` |
+| `--offload` | CPU offload mode: `auto`, `none`, `model`, `sequential` |
+| `--num_inference_steps` | Quality/speed tradeoff (default: 30) |
 
-1. **Video Encoding**: The input video is encoded to latent space using the VAE
-2. **Noise Injection**: A controlled amount of noise is added to the latents (flow matching at t=0.5)
-3. **Attention Extraction**: A forward pass through the transformer extracts self-attention maps from all 48 layers
-4. **Spatial-Temporal Attention**: For each frame, computes how much each spatial position attends to object regions across all frames
-5. **Mask Generation**: Attention values are upsampled, thresholded, and combined with the object mask
+---
 
-The key insight is that regions affected by the object (shadows, reflections) will have high attention weights to the object itself.
+## Self-Attention Mask Generation
 
-#### Parameters
+If you only have an `object_mask.mp4`, generate the `total_mask.mp4` (object + effects) automatically using the diffusion model's self-attention:
+
+```bash
+python self_attention_map.py \
+  --video_folder ./example_videos/three_swans_lake \
+  --height 480 --width 704 \
+  --preset mps_24gb \
+  --use_prompt_cache
+```
+
+**How it works:** The video is encoded to latent space, noise is injected, and a forward pass extracts self-attention maps from all 48 transformer layers. Regions that attend strongly to the object (like its shadow or reflection) are identified and merged into the total mask.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--video_folder` | (required) | Folder containing `video.mp4` and `object_mask.mp4` |
-| `--height` | 512 | Processing height |
-| `--width` | 768 | Processing width |
-| `--threshold` | adaptive | Attention threshold (None = mean + 0.5*std) |
-| `--dilation` | 3 | Morphological dilation kernel size for smoothing |
+| `--video_folder` | (required) | Folder with `video.mp4` and `object_mask.mp4` |
+| `--height`, `--width` | 512, 768 | Processing resolution |
+| `--threshold` | adaptive | Attention threshold (`None` = mean + 0.5*std) |
+| `--dilation` | 3 | Morphological dilation kernel size |
 
-#### Example
+Output: `total_mask.mp4` is written to the input folder.
 
-```bash
-# Recommended settings (works well for most videos)
-python self_attention_map.py --video_folder example_videos/cat_reflection --height 512 --width 768 --threshold 0.07 --dilation 3
-
-# Basic usage with adaptive threshold
-python self_attention_map.py --video_folder ./example_videos/cat_reflection
-
-# With custom threshold for more/less effect coverage
-python self_attention_map.py --video_folder ./example_videos/cat_reflection --threshold 0.08
-
-# Higher resolution processing
-python self_attention_map.py --video_folder ./example_videos/cat_reflection --height 720 --width 1280
-```
-
-#### Output
-
-The script generates `total_mask.mp4` in the same folder as the input, which includes:
-- The original object mask
-- Detected effects regions (shadows, reflections, etc.)
-
-Typical mask expansion ratios are 1.5x-2.0x depending on the scene's effects.
-
-#### 💡 Refine with SAM2
-
-For even better results, you can use the attention-based mask as a prompt for [SAM2](https://github.com/facebookresearch/segment-anything-2):
-This two-stage approach combines the semantic understanding of the diffusion model's attention (which knows *what* regions are related to the object) with SAM2's precise boundary detection (which knows *exactly where* those regions are).
-
-
-### Important Note on Attention Guidance
-
-> **⚠️ Note (Updated 1/26):** While our paper describes Temporal Attention Guidance and Spatial Attention Guidance using TAP-Net for improved temporal consistency, these features were originally developed for LTX-Video-0.9.1. We recently encountered a bug while fetching the LTX-0.9.1 model (as of 1/26) which we did not encounter during paper submission (5/25). We are working to fix this issue.
->
-> **In the meantime, we have upgraded to LTX-Video-0.9.7**, which we found achieves good object removal results **without** the explicit temporal and spatial attention guidance. The current code runs without attention guidance, but the implementation can be found in `attention_guidance.py` for reference.
+For sharper boundaries, use the generated mask as a prompt for [SAM2](https://github.com/facebookresearch/segment-anything-2).
 
 ---
 
-## Foreground Extraction & Layer Composition
+## Foreground Extraction & Composition
 
-Extract the foreground layer (object + its effects) from a video and compose it onto a new background.
-
-### Prerequisites
-
-Before running, you need:
-1. The original video with the object
-2. A clean background video (from object removal)
-3. Object mask and total mask videos
-4. A new background video to compose onto
-
-### Usage
+Extract the foreground layer and composite it onto a new background:
 
 ```bash
-python foreground_composition.py --video_folder swan_lake --new_bg ./results/cat_reflection.mp4 --height 480 --width 704 --use_prompt_cache
+python foreground_composition.py \
+  --video_folder three_swans_lake \
+  --new_bg ./results/cat_reflection.mp4 \
+  --height 480 --width 704 \
+  --use_prompt_cache
 ```
 
-### Configuration
+**How it works:**
 
-Main CLI options:
+1. Encode the original video and the clean background (from object removal) to latent space
+2. Compute the foreground: `z_foreground = z_original - z_background`
+3. Pixel-inject the object region for fine detail preservation
+4. Add to the new background: `z_composite = z_new_bg + z_foreground`
+5. Refine with a few noising-denoising steps
 
-- `--video_folder` source folder under `example_videos/`
-- `--new_bg` path to the replacement background video
-- `--checkpoint` local model file (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`)
-- `--height --width` output size (M4 Pro target: `480 704`)
-- `--use_prompt_cache` for refinement stage text-conditioning reuse
+**Output:**
 
-### How it works
-
-1. Encodes both the original video and clean background to latent space
-2. Computes the latent difference (foreground = original - background)
-3. Uses pixel injection for the object region to preserve details
-4. Encodes the new background video to latent space
-5. Adds the foreground latents to the new background latents
-6. Applies refinement through a few noising-denoising steps
-
-### Output
-
-Results are saved to `results/`:
 ```
 results/
-├── <video_folder>_foreground.mp4       # Extracted foreground layer
-├── <video_folder>_latent_addition.mp4  # Latent addition result (before refinement)
-└── <video_folder>_refined.mp4          # Final refined composition
+├── <video>_foreground.mp4        # extracted foreground layer
+├── <video>_latent_addition.mp4   # before refinement
+└── <video>_refined.mp4           # final composition
 ```
 
+---
+
+## Memory Presets
+
+| Preset | Target | Resolution | Max Frames | Notes |
+|--------|--------|------------|------------|-------|
+| `mps_24gb` | Apple Silicon 24 GB | 704x480 | 97 | Attention slicing, model CPU offload, FP16 |
+| `16gb` | CUDA 16 GB | 704x480 | 97 | FP8 casting, group offloading, sequential CPU offload |
+| `24gb` | CUDA 24 GB | 768x512 | 121 | FP8 casting, group offloading, model CPU offload |
+| `32gb` | CUDA 32 GB+ | 768x512 | 161 | VAE tiling only |
+
+The `mps_24gb` preset accounts for macOS using ~35% of unified memory, leaving ~15.6 GB effective for ML workloads. It disables FP8 casting and group offloading (unsupported on MPS) and relies on attention slicing + model CPU offload instead.
 
 ---
 
-### Generation Parameters Tips
-- **num_inference_steps**: 30 is a good default; increase for better quality
-- **guidance_scale**: Default is 3.0; adjust based on prompt specificity
-- **denoise_strength**: For refinement, 0.3 works well; lower values preserve more details
+## Tips
+
+- **First run is slower** — the T5 text encoder must run once. Use `--use_prompt_cache` so subsequent runs skip it entirely.
+- **Start with the preset defaults** for resolution and frame count. Increase only if you have headroom.
+- **Shorter clips** process faster and use less memory. Split long videos into segments if needed.
+- **`--offload sequential`** uses the least memory but is noticeably slower than `--offload model`.
+- **Monitor memory** on macOS with Activity Monitor or `sudo powermetrics --samplers gpu_power`.
 
 ---
 
-## Citation
+## Note on Attention Guidance
 
-If you find this work useful, please cite our paper:
+The original paper describes Temporal and Spatial Attention Guidance using TAP-Net. The current codebase uses LTX-Video 0.9.5/0.9.7, which achieves good results without explicit attention guidance. The guidance implementation is available in `attention_guidance.py` for reference.
+
+---
+
+## Credits
+
+This project builds directly on **OmnimatteZero** by Dvir Samuel, Matan Levy, Nir Darshan, Gal Chechik, and Rami Ben-Ari (Samsung AI Center / Bar-Ilan University). All credit for the core method — latent conditioning, self-attention mask generation, and latent arithmetic for foreground composition — belongs to them.
+
+**Original repository:** [github.com/dvirsamuel/OmnimatteZero](https://github.com/dvirsamuel/OmnimatteZero)
+
+If you use this work, please cite the original paper:
 
 ```bibtex
 @inproceedings{samuel2025omnimattezero,
@@ -253,156 +250,12 @@ If you find this work useful, please cite our paper:
 }
 ```
 
----
+### Other Acknowledgments
 
-## Acknowledgments
-
-- [LTX-Video](https://github.com/Lightricks/LTX-Video) for the base video diffusion model
-- [Diffusers](https://github.com/huggingface/diffusers) for the diffusion pipeline infrastructure
-- [TAP-Net](https://github.com/google-deepmind/tapnet) for point tracking
+- [LTX-Video](https://github.com/Lightricks/LTX-Video) — base video diffusion model
+- [Diffusers](https://github.com/huggingface/diffusers) — diffusion pipeline infrastructure
+- [TAP-Net](https://github.com/google-deepmind/tapnet) — point tracking (reference)
 
 ---
 
-## Troubleshooting
-
-### Out of Memory (CUDA OOM)
-- Use the memory-optimized scripts (see section below)
-- Use `--preset 16gb` for aggressive memory optimization
-- Reduce video resolution with `--height` and `--width`
-- Reduce frame count with `--max_frames`
-- Enable `--skip_upscale` for object removal
-
-### Slow Generation
-- Reduce `num_inference_steps`
-- Use smaller video resolution
-- Ensure all packages are installed as specified in `requirements.txt`
-
----
-
-## 🚀 Memory-Optimized Version (16GB VRAM)
-
-We provide memory-optimized versions of all scripts that can run on consumer GPUs with 16GB VRAM (RTX 4080, RTX 3090, etc.).
-
-### Key Optimizations Applied
-
-1. **FP8 Layerwise Casting** - Stores transformer weights in float8 format, computes in bfloat16
-2. **Group Offloading** - Moves layer groups to CPU with CUDA streams for overlapped data transfer
-3. **VAE Tiling & Slicing** - Processes video in tiles to reduce peak memory
-4. **Selective Attention Extraction** - Uses subset of attention layers for mask generation
-5. **Aggressive Memory Clearing** - Proactive garbage collection between operations
-
-### Memory Presets
-
-| Preset | Target VRAM | Resolution | Max Frames | Inference Steps |
-|--------|-------------|------------|------------|-----------------|
-| `16gb` | 16 GB | 704×480 | 97 | 20 |
-| `24gb` | 24 GB | 768×512 | 121 | 25 |
-| `32gb` | 32+ GB | 768×512 | 161 | 30 |
-
-### Optimized Scripts
-
-#### Object Removal (16GB VRAM)
-
-```bash
-# Basic usage with 16GB preset
-python object_removal_optimized.py --preset 16gb
-
-# Process a specific video
-python object_removal_optimized.py --preset 16gb --video cat_reflection
-
-# Custom resolution and frames
-python object_removal_optimized.py --preset 16gb --height 384 --width 576 --max_frames 65
-
-# Skip upscaling for faster processing
-python object_removal_optimized.py --preset 16gb --skip_upscale
-```
-
-#### Self-Attention Mask Generation (16GB VRAM)
-
-```bash
-# Basic usage
-python self_attention_map_optimized.py --video_folder ./example_videos/cat_reflection --preset 16gb
-
-# With fewer attention layers (even less memory)
-python self_attention_map_optimized.py --video_folder ./example_videos/cat_reflection --preset 16gb --max_layers 2
-```
-
-#### Foreground Composition (16GB VRAM)
-
-```bash
-# Basic usage
-python foreground_composition_optimized.py --preset 16gb --video_folder swan_lake --new_bg_video cat_reflection
-
-# Skip refinement for faster processing
-python foreground_composition_optimized.py --preset 16gb --video_folder swan_lake --skip_refinement
-```
-
-### Using the Memory Utilities in Your Code
-
-```python
-from OmnimatteZero import OmnimatteZero
-from memory_utils import (
-    MemoryConfig,
-    apply_memory_optimizations,
-    auto_configure,
-    print_memory_stats
-)
-
-# Auto-detect GPU and configure
-config = auto_configure()  # Returns appropriate preset based on detected VRAM
-
-# Or manually select a preset
-config = MemoryConfig("16gb")
-
-# Load pipeline
-pipe = OmnimatteZero.from_pretrained(
-    "a-r-r-o-w/LTX-Video-0.9.7-diffusers",
-    torch_dtype=torch.bfloat16
-)
-
-# Apply optimizations (IMPORTANT: do this BEFORE moving to GPU for group offloading)
-if not config.enable_model_cpu_offload:
-    pipe.to("cuda")
-pipe = apply_memory_optimizations(pipe, config)
-
-# Check memory usage
-print_memory_stats()
-
-# Get recommended settings for your VRAM
-from memory_utils import get_recommended_settings
-settings = get_recommended_settings(16.0)  # 16GB VRAM
-print(settings)
-# {'preset': '16gb', 'height': 480, 'width': 704, 'num_frames': 97, 'num_inference_steps': 20}
-```
-
-### Performance vs Quality Trade-offs
-
-| Setting | Memory Savings | Quality Impact |
-|---------|---------------|----------------|
-| FP8 casting | ~30% | Minimal (skip norm layers) |
-| Group offloading | ~40% | None (just slower) |
-| Reduced resolution | Significant | Noticeable |
-| Fewer frames | Significant | Shorter videos only |
-| Skip upscaling | ~20% | Lower final resolution |
-| Fewer inference steps | ~15% | Some quality loss |
-
-### Tips for Best Results on Limited VRAM
-
-1. **Start with the 16gb preset** and adjust from there
-2. **Process shorter clips** - split long videos into segments
-3. **Use lower resolution** for testing, then increase for final output
-4. **Skip upscaling** for initial experiments
-5. **Close other GPU applications** (browsers, games, etc.)
-6. **Monitor with `nvidia-smi`** to see actual usage
-
-### Benchmarks
-
-Tested on RTX 4080 (16GB VRAM):
-
-| Operation | 32gb Preset | 16gb Preset | 
-|-----------|-------------|-------------|
-| Object Removal (97 frames) | OOM | ~4 min |
-| Mask Generation | OOM | ~2 min |
-| Foreground Composition | OOM | ~3 min |
-
----
+Built by [Ak-Gautam](https://github.com/Ak-Gautam) | [Twitter/X](https://x.com/Gautam_A_k)
