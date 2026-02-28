@@ -2,7 +2,7 @@
 
 **Training-free video matting, object removal, and layer composition — optimized for Apple Silicon.**
 
-This is a memory-optimized fork of [OmnimatteZero](https://github.com/dvirsamuel/OmnimatteZero) by Samuel et al., re-engineered to run on Apple M-series chips with ~22 GB unified memory. If you have a 24 GB MacBook Pro (M4 Pro / M4 Max), this will run out of the box — no NVIDIA GPU required.
+Based on [OmnimatteZero](https://github.com/dvirsamuel/OmnimatteZero) by Samuel et al., this project re-engineers the pipeline to run on Apple M-series chips with ~22 GB unified memory. If you have a 24 GB MacBook Pro (M4 Pro / M4 Max), this will run out of the box — no NVIDIA GPU required.
 
 [![Original Paper](https://img.shields.io/badge/arXiv-2503.18033-b31b1b.svg)](https://arxiv.org/abs/2503.18033)
 [![Original Project Page](https://img.shields.io/badge/Project%20Page-OmnimatteZero-blue)](https://dvirsamuel.github.io/omnimattezero.github.io/)
@@ -13,21 +13,26 @@ This is a memory-optimized fork of [OmnimatteZero](https://github.com/dvirsamuel
 
 ## Example: Object Removal
 
-**Input** — three swans on a lake:
-
-https://github.com/user-attachments/assets/three_swans_lake_input
-
-https://github.com/Ak-Gautam/OmnimatteZeroEfficient/raw/main/example_videos/three_swans_lake/video.mp4
-
-**Result** — swans and their reflections cleanly removed:
-
-https://github.com/Ak-Gautam/OmnimatteZeroEfficient/raw/main/results/three_swans_lake.mp4
+<table>
+<tr>
+<td align="center"><strong>Input</strong></td>
+<td align="center"><strong>Result</strong></td>
+</tr>
+<tr>
+<td><img src="media_assets/three_swans_lake_input.gif" width="400"></td>
+<td><img src="media_assets/three_swans_lake_result.gif" width="400"></td>
+</tr>
+<tr>
+<td align="center"><em>Three swans on a lake</em></td>
+<td align="center"><em>Swans and reflections removed</em></td>
+</tr>
+</table>
 
 ---
 
-## What This Fork Adds
+## What This Project Adds
 
-The original OmnimatteZero requires a 32 GB+ CUDA GPU. This fork makes it practical on consumer Apple Silicon hardware:
+The original OmnimatteZero requires a 32 GB+ CUDA GPU. This project makes it practical on consumer Apple Silicon hardware:
 
 - **MPS backend support** — runs natively on Apple M-series GPUs via PyTorch MPS
 - **Unified memory-aware configuration** — tuned for the ~65% of unified memory actually available to ML workloads after macOS overhead
