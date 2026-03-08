@@ -13,4 +13,5 @@ __pycache__/
 model_checkpoints/
 *.safetensors
 *.mp4
+media_assets/
 /models--Lightricks--LTX-Video
