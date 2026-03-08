@@ -142,6 +142,7 @@ class OmnimatteZero(LTXConditionPipeline):
             callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
             callback_on_step_end_tensor_inputs: List[str] = ["latents"],
             max_sequence_length: int = 256,
+            unload_transformer_after_generation: bool = False,
     ):
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
@@ -389,10 +390,10 @@ class OmnimatteZero(LTXConditionPipeline):
             self.transformer_temporal_patch_size,
         )
 
-        # Free transformer weights (~3.7 GB) before VAE decode.
-        # Safe because the denoising loop is complete and only VAE is needed below.
-        self.transformer = None
-        clear_memory()
+        if unload_transformer_after_generation:
+            # Optional cleanup for one-shot scripts that do not reuse the pipeline.
+            self.transformer = None
+            clear_memory()
 
         if output_type == "latent":
             video = latents

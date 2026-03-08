@@ -13,7 +13,7 @@ import argparse
 import os
 
 import torch
-from diffusers.utils import export_to_video, load_video
+from diffusers.utils import export_to_video
 from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
 
 from device_utils import (
@@ -28,31 +28,21 @@ from device_utils import (
     MemoryTracker,
 )
 from memory_utils import (
-    MemoryConfig,
     apply_memory_optimizations,
-    round_to_vae_compatible,
-    round_frames_to_vae_compatible,
 )
-from prompt_cache import (
-    build_prompt_cache_key,
-    encode_prompts_with_t5_only,
-    find_legacy_prompt_cache,
-    get_prompt_cache_path,
-    load_prompt_cache,
-    move_prompt_cache_to_device,
-    normalize_cached_prompt_tensors,
-    save_prompt_cache,
+from runtime_utils import (
+    DEFAULT_INPUT_DIR,
+    DEFAULT_OUTPUT_DIR,
+    WindowedFrameAssembler,
+    build_prompt_kwargs,
+    load_prompt_tensors,
+    load_video_frames,
+    pad_frames_to_length,
+    plan_processing,
+    plan_temporal_windows,
+    resolve_video_folder,
+    inspect_video,
 )
-
-
-_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_PROMPT_CACHE_DIR = os.path.join(_PROJECT_ROOT, "cached_embeddings")
-
-
-def _resolve_video_folder(base_dir: str, video: str) -> str:
-    if os.path.isdir(video):
-        return video
-    return os.path.join(base_dir, video)
 
 
 @torch.no_grad()
@@ -63,9 +53,11 @@ def run_object_removal(
     out_dir: str,
     checkpoint: str,
     cache_dir: str,
-    height: int = 480,
-    width: int = 704,
-    num_frames: int = 97,
+    height: int | None = None,
+    width: int | None = None,
+    num_frames: int | None = None,
+    window_frames: int | None = None,
+    overlap_frames: int | None = None,
     num_inference_steps: int = 12,
     seed: int = 1,
     prompt: str = "Empty",
@@ -76,7 +68,7 @@ def run_object_removal(
     device = get_device()
     dtype = get_optimal_dtype()
 
-    video_folder = _resolve_video_folder(base_dir, video)
+    video_folder = resolve_video_folder(base_dir, video)
     video_path = os.path.join(video_folder, "video.mp4")
     mask_path = os.path.join(video_folder, "total_mask.mp4")
 
@@ -91,54 +83,38 @@ def run_object_removal(
     os.makedirs(out_dir, exist_ok=True)
     print_device_info()
 
-    # --- 1) Build/load prompt embeddings (before loading video model) ---
-    prompt_tensors_cpu = None
-    if use_prompt_cache:
-        cache_key = build_prompt_cache_key(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            checkpoint_path=checkpoint,
-            max_sequence_length=max_sequence_length,
-            num_videos_per_prompt=1,
-            dtype=dtype,
-        )
-        prompt_cache_path = get_prompt_cache_path(_DEFAULT_PROMPT_CACHE_DIR, cache_key)
-        if os.path.exists(prompt_cache_path):
-            print(f"Loading prompt embeddings cache: {os.path.basename(prompt_cache_path)}")
-            prompt_tensors_cpu = load_prompt_cache(prompt_cache_path)
-        else:
-            legacy_path = find_legacy_prompt_cache(_DEFAULT_PROMPT_CACHE_DIR, prompt)
-            if legacy_path is not None:
-                print(f"Using legacy cache: {os.path.basename(legacy_path)}")
-                prompt_tensors_cpu = load_prompt_cache(legacy_path)
-            else:
-                print("Prompt cache miss; loading T5 encoder to compute embeddings...")
-                prompt_tensors_cpu = encode_prompts_with_t5_only(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    max_sequence_length=max_sequence_length,
-                    num_videos_per_prompt=1,
-                    dtype=dtype,
-                    cache_dir=cache_dir,
-                    device=device,
-                    do_classifier_free_guidance=True,
-                )
-                save_prompt_cache(prompt_cache_path, prompt_tensors_cpu)
-                print(f"Saved prompt cache: {os.path.basename(prompt_cache_path)}")
-                clear_memory()
-    else:
-        print("Prompt cache disabled; loading T5 encoder for one-time encoding...")
-        prompt_tensors_cpu = encode_prompts_with_t5_only(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            max_sequence_length=max_sequence_length,
-            num_videos_per_prompt=1,
-            dtype=dtype,
-            cache_dir=cache_dir,
-            device=device,
-            do_classifier_free_guidance=True,
-        )
-        clear_memory()
+    video_info = inspect_video(video_path)
+    plan = plan_processing(
+        video_info,
+        requested_width=width,
+        requested_height=height,
+        requested_total_frames=num_frames,
+        requested_window_frames=window_frames,
+        requested_overlap_frames=overlap_frames,
+        requested_num_inference_steps=num_inference_steps,
+    )
+    windows = plan_temporal_windows(plan.total_frames, plan.window_frames, plan.overlap_frames)
+
+    print(
+        f"Processing {plan.total_frames} frames at {plan.width}x{plan.height} "
+        f"with {len(windows)} window(s) of up to {plan.window_frames} frames"
+    )
+    for warning in plan.warnings:
+        print(f"Note: {warning}")
+
+    prompt_tensors = load_prompt_tensors(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        checkpoint_path=checkpoint,
+        dtype=dtype,
+        device=device,
+        use_prompt_cache=use_prompt_cache,
+        max_sequence_length=max_sequence_length,
+        cache_dir_for_t5=cache_dir,
+        require_negative=True,
+    )
+    prompt_kwargs = build_prompt_kwargs(prompt_tensors, max_sequence_length=max_sequence_length)
+    clear_memory()
 
     # --- 2) Load pipeline (skip T5 since we have cached embeddings) ---
     print("Loading OmnimatteZero pipeline...")
@@ -153,54 +129,48 @@ def run_object_removal(
     apply_memory_optimizations(pipe)
     print_memory_stats()
 
-    # --- 3) Ensure dimensions are VAE-compatible ---
-    height, width = round_to_vae_compatible(height, width)
-    num_frames = round_frames_to_vae_compatible(num_frames)
+    assembler = WindowedFrameAssembler(merge_mode="blend")
+    for window_index, window in enumerate(windows, start=1):
+        raw_video = load_video_frames(video_path, start=window.start, end=window.end)
+        raw_mask = load_video_frames(mask_path, start=window.start, end=window.end)
+        source_frame_count = len(raw_video)
 
-    # --- 4) Load video + mask ---
-    raw_video = load_video(video_path)[:num_frames]
-    raw_mask = load_video(mask_path)[:num_frames]
-    print(f"Loaded {len(raw_video)} video frames, {len(raw_mask)} mask frames")
+        if source_frame_count == 0 or len(raw_mask) == 0:
+            raise RuntimeError(f"Empty frame window loaded for {window.start}:{window.end}")
 
-    condition1 = LTXVideoCondition(video=raw_video, frame_index=0)
-    condition2 = LTXVideoCondition(video=raw_mask, frame_index=0)
-    video_num_frames = len(raw_video)
+        padded_video = pad_frames_to_length(raw_video, plan.window_frames)
+        padded_mask = pad_frames_to_length(raw_mask, plan.window_frames)
 
-    del raw_video, raw_mask
-    clear_memory()
+        condition1 = LTXVideoCondition(video=padded_video, frame_index=0)
+        condition2 = LTXVideoCondition(video=padded_mask, frame_index=0)
+        generator = get_generator(seed + window.start, device=device)
 
-    # --- 5) Prepare prompt embeddings ---
-    prompt_tensors_cpu = normalize_cached_prompt_tensors(prompt_tensors_cpu, require_negative=True)
-    prompt_tensors = move_prompt_cache_to_device(prompt_tensors_cpu, device=device, dtype=dtype)
-    prompt_kwargs = {
-        "prompt": None,
-        "negative_prompt": None,
-        "prompt_embeds": prompt_tensors.get("prompt_embeds"),
-        "prompt_attention_mask": prompt_tensors.get("prompt_attention_mask"),
-        "negative_prompt_embeds": prompt_tensors.get("negative_prompt_embeds"),
-        "negative_prompt_attention_mask": prompt_tensors.get("negative_prompt_attention_mask"),
-        "max_sequence_length": max_sequence_length,
-    }
-
-    # --- 6) Run diffusion ---
-    generator = get_generator(seed, device=device)
-    print(f"Running diffusion ({num_inference_steps} steps, {width}x{height}, {video_num_frames} frames)...")
-
-    with MemoryTracker("Generation"):
-        result = pipe.my_call(
-            conditions=[condition1, condition2],
-            width=width,
-            height=height,
-            num_frames=video_num_frames,
-            num_inference_steps=num_inference_steps,
-            generator=generator,
-            output_type="pil",
-            **prompt_kwargs,
+        print(
+            f"Window {window_index}/{len(windows)}: frames {window.start}:{window.end} "
+            f"({source_frame_count} source, {plan.window_frames} model)"
         )
+        with MemoryTracker(f"Generation window {window_index}"):
+            result = pipe.my_call(
+                conditions=[condition1, condition2],
+                width=plan.width,
+                height=plan.height,
+                num_frames=plan.window_frames,
+                num_inference_steps=plan.num_inference_steps,
+                generator=generator,
+                output_type="pil",
+                unload_transformer_after_generation=False,
+                **prompt_kwargs,
+            )
 
-    frames = result.frames[0]
+        frames = result.frames[0][:source_frame_count]
+        assembler.add_window(window, frames)
+
+        del raw_video, raw_mask, padded_video, padded_mask, condition1, condition2, result, frames
+        clear_memory()
+
+    frames = assembler.finalize()
     out_path = os.path.join(out_dir, f"{os.path.basename(video_folder)}.mp4")
-    export_to_video(frames, out_path, fps=24)
+    export_to_video(frames, out_path, fps=max(1, int(round(plan.fps or 24))))
 
     print_memory_stats()
     print(f"Wrote: {out_path}")
@@ -208,15 +178,17 @@ def run_object_removal(
 
 def main():
     parser = argparse.ArgumentParser(description="OmnimatteZero object removal")
-    parser.add_argument("--base_dir", type=str, default="example_videos")
+    parser.add_argument("--base_dir", type=str, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--video", type=str, required=True, help="Video folder name under base_dir, or a full path")
-    parser.add_argument("--out_dir", type=str, default="results")
+    parser.add_argument("--out_dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--cache_dir", type=str, default="")
 
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--width", type=int, default=704)
-    parser.add_argument("--num_frames", type=int, default=97)
+    parser.add_argument("--height", type=int, default=None, help="Output height. Defaults to auto-fit input.")
+    parser.add_argument("--width", type=int, default=None, help="Output width. Defaults to auto-fit input.")
+    parser.add_argument("--num_frames", type=int, default=None, help="Optional cap on total frames to process.")
+    parser.add_argument("--window_frames", type=int, default=None, help="Frames per generation window.")
+    parser.add_argument("--overlap_frames", type=int, default=None, help="Overlap between generation windows.")
     parser.add_argument("--num_inference_steps", type=int, default=12)
     parser.add_argument("--seed", type=int, default=1)
 
@@ -237,6 +209,8 @@ def main():
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
+        window_frames=args.window_frames,
+        overlap_frames=args.overlap_frames,
         num_inference_steps=args.num_inference_steps,
         seed=args.seed,
         prompt=args.prompt,

@@ -23,7 +23,7 @@ from typing import Optional, Union
 import torch
 from diffusers import AutoencoderKLLTXVideo
 from diffusers.pipelines.ltx.pipeline_ltx_condition import retrieve_latents
-from diffusers.utils import export_to_video, load_video
+from diffusers.utils import export_to_video
 from PIL import Image
 
 from device_utils import (
@@ -39,17 +39,20 @@ from device_utils import (
 )
 from memory_utils import (
     apply_memory_optimizations,
-    round_frames_to_vae_compatible,
 )
-from prompt_cache import (
-    build_prompt_cache_key,
-    encode_prompts_with_t5_only,
-    find_legacy_prompt_cache,
-    get_prompt_cache_path,
-    load_prompt_cache,
-    move_prompt_cache_to_device,
-    normalize_cached_prompt_tensors,
-    save_prompt_cache,
+from runtime_utils import (
+    DEFAULT_INPUT_DIR,
+    DEFAULT_OUTPUT_DIR,
+    WindowedFrameAssembler,
+    build_prompt_kwargs,
+    inspect_video,
+    load_prompt_tensors,
+    load_video_frames,
+    pad_frames_to_length,
+    plan_processing,
+    plan_temporal_windows,
+    resolve_relative_path,
+    resolve_video_folder,
 )
 
 
@@ -119,67 +122,26 @@ class MyAutoencoderKLLTXVideo(AutoencoderKLLTXVideo):
         return dec, dec2, dec_mask, dec_mask2
 
 
-def _load_or_build_prompt_embeds(
+def _load_windowed_video_tensor(
+    pipe,
+    path: str,
+    window,
     *,
-    prompt: str,
-    negative_prompt: str,
-    checkpoint: str,
-    dtype: torch.dtype,
+    target_length: int,
+    width: int,
+    height: int,
     device: torch.device,
-    use_prompt_cache: bool,
-    max_sequence_length: int,
-    cache_dir_for_t5: str,
-) -> dict:
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    cache_dir = os.path.join(project_root, "cached_embeddings")
-    cache_key = build_prompt_cache_key(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        checkpoint_path=checkpoint,
-        max_sequence_length=max_sequence_length,
-        num_videos_per_prompt=1,
-        dtype=dtype,
+):
+    raw_frames = load_video_frames(path, start=window.start, end=window.end)
+    source_frame_count = len(raw_frames)
+    if source_frame_count == 0:
+        raise RuntimeError(f"No frames were loaded from {path} for window {window.start}:{window.end}")
+    padded_frames = pad_frames_to_length(raw_frames, target_length)
+    tensor = pipe.video_processor.preprocess_video(padded_frames, width=width, height=height).to(
+        device=device,
+        dtype=torch.float32,
     )
-    cache_path = get_prompt_cache_path(cache_dir, cache_key)
-
-    cached = None
-    if use_prompt_cache:
-        if os.path.exists(cache_path):
-            cached = load_prompt_cache(cache_path)
-        else:
-            legacy_path = find_legacy_prompt_cache(cache_dir, prompt)
-            if legacy_path is not None:
-                cached = load_prompt_cache(legacy_path)
-
-    if cached is None:
-        print("Prompt cache miss; loading T5 encoder only to compute embeddings...")
-        cached = encode_prompts_with_t5_only(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            max_sequence_length=max_sequence_length,
-            num_videos_per_prompt=1,
-            dtype=dtype,
-            cache_dir=cache_dir_for_t5,
-            device=device,
-            do_classifier_free_guidance=True,
-        )
-        if use_prompt_cache:
-            save_prompt_cache(cache_path, cached)
-            print(f"Saved prompt embeddings cache: {os.path.basename(cache_path)}")
-        clear_memory()
-
-    cached = normalize_cached_prompt_tensors(cached, require_negative=True)
-
-    moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
-    return {
-        "prompt": None,
-        "negative_prompt": None,
-        "prompt_embeds": moved.get("prompt_embeds"),
-        "prompt_attention_mask": moved.get("prompt_attention_mask"),
-        "negative_prompt_embeds": moved.get("negative_prompt_embeds"),
-        "negative_prompt_attention_mask": moved.get("negative_prompt_attention_mask"),
-        "max_sequence_length": max_sequence_length,
-    }
+    return tensor, source_frame_count
 
 
 @torch.no_grad()
@@ -190,9 +152,13 @@ def main():
     parser.add_argument("--new_bg", type=str, required=True,
                         help="Path to new background video (mp4)")
 
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--width", type=int, default=704)
-    parser.add_argument("--out_dir", type=str, default="results")
+    parser.add_argument("--base_dir", type=str, default=DEFAULT_INPUT_DIR)
+    parser.add_argument("--height", type=int, default=None, help="Output height. Defaults to auto-fit input.")
+    parser.add_argument("--width", type=int, default=None, help="Output width. Defaults to auto-fit input.")
+    parser.add_argument("--num_frames", type=int, default=None, help="Optional cap on total frames to process.")
+    parser.add_argument("--window_frames", type=int, default=None, help="Frames per processing window.")
+    parser.add_argument("--overlap_frames", type=int, default=None, help="Overlap between processing windows.")
+    parser.add_argument("--out_dir", type=str, default=DEFAULT_OUTPUT_DIR)
 
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--cache_dir", type=str, default="", help="HuggingFace cache dir (optional)")
@@ -214,6 +180,44 @@ def main():
 
     print_device_info()
 
+    video_folder = resolve_video_folder(args.base_dir, args.video_folder)
+    source_video_path = os.path.join(video_folder, "video.mp4")
+    object_mask_path = os.path.join(video_folder, "object_mask.mp4")
+    total_mask_path = os.path.join(video_folder, "total_mask.mp4")
+    clean_bg_path = os.path.join(args.out_dir, f"{os.path.basename(video_folder)}.mp4")
+    new_bg_path = resolve_relative_path(args.new_bg)
+
+    for required_path in [source_video_path, object_mask_path, total_mask_path, clean_bg_path, new_bg_path]:
+        if not os.path.exists(required_path):
+            raise FileNotFoundError(f"Missing required input: {required_path}")
+
+    source_info = inspect_video(source_video_path)
+    available_frames = min(
+        source_info.frame_count,
+        inspect_video(clean_bg_path).frame_count,
+        inspect_video(object_mask_path).frame_count,
+        inspect_video(total_mask_path).frame_count,
+        inspect_video(new_bg_path).frame_count,
+    )
+    requested_total_frames = available_frames if args.num_frames is None else min(available_frames, args.num_frames)
+    plan = plan_processing(
+        source_info,
+        requested_width=args.width,
+        requested_height=args.height,
+        requested_total_frames=requested_total_frames,
+        requested_window_frames=args.window_frames,
+        requested_overlap_frames=args.overlap_frames,
+        requested_num_inference_steps=10,
+    )
+    windows = plan_temporal_windows(plan.total_frames, plan.window_frames, plan.overlap_frames)
+
+    print(
+        f"Processing {plan.total_frames} frames at {plan.width}x{plan.height} "
+        f"with {len(windows)} window(s) of up to {plan.window_frames} frames"
+    )
+    for warning in plan.warnings:
+        print(f"Note: {warning}")
+
     # --- 1) Load pipeline (skip T5 since we'll use cached embeddings) ---
     pipe = load_pipeline(
         checkpoint_path=args.checkpoint,
@@ -232,141 +236,167 @@ def main():
     apply_memory_optimizations(pipe)
     print_memory_stats()
 
-    w, h = args.width, args.height
-    video_folder = args.video_folder
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # --- 2) Load and preprocess videos sequentially to minimize peak memory ---
-    print("Loading video_p...")
-    video_p_raw = load_video(os.path.join("example_videos", video_folder, "video.mp4"))
-    video_p = pipe.video_processor.preprocess_video(video_p_raw, width=w, height=h).to(device=device, dtype=torch.float32)
-    del video_p_raw
-
-    print("Loading video_bg...")
-    video_bg_raw = load_video(os.path.join("results", f"{video_folder}.mp4"))
-    video_bg = pipe.video_processor.preprocess_video(video_bg_raw, width=w, height=h).to(device=device, dtype=torch.float32)
-    del video_bg_raw
-
-    print("Loading video_mask...")
-    video_mask_raw = load_video(os.path.join("example_videos", video_folder, "object_mask.mp4"))
-    video_mask = pipe.video_processor.preprocess_video(video_mask_raw, width=w, height=h).to(device=device, dtype=torch.float32)
-    del video_mask_raw
-
-    print("Loading video_mask2...")
-    video_mask2_raw = load_video(os.path.join("example_videos", video_folder, "total_mask.mp4"))
-    video_mask2 = pipe.video_processor.preprocess_video(video_mask2_raw, width=w, height=h).to(device=device, dtype=torch.float32)
-    del video_mask2_raw
-
-    print("Loading video_new_bg...")
-    video_new_bg_raw = load_video(args.new_bg)
-    video_new_bg = pipe.video_processor.preprocess_video(video_new_bg_raw, width=w, height=h).to(device=device, dtype=torch.float32)
-    del video_new_bg_raw
-
-    clear_memory()
-
-    # Align frame counts (VAE-compatible)
-    nframes = min(video_new_bg.shape[2], video_p.shape[2])
-    nframes = round_frames_to_vae_compatible(nframes)
-    video_p = video_p[:, :, :nframes]
-    video_bg = video_bg[:, :, :nframes]
-    video_mask = video_mask[:, :, :nframes]
-    video_mask2 = video_mask2[:, :, :nframes]
-    video_new_bg = video_new_bg[:, :, :nframes]
-
-    print(f"Processing {nframes} frames at {w}x{h}")
-
-    # --- 3) VAE encode/decode + latent arithmetic ---
-    temb = torch.tensor(0.0, device=device, dtype=torch.float32)
-
-    with MemoryTracker("VAE Encoding/Decoding"):
-        x, foreground, z_mask, z_mask2 = pipe.vae(
-            [video_p, video_bg, video_mask, video_mask2, video_new_bg],
-            temb=temb,
+    prompt_kwargs = None
+    if not args.skip_refinement:
+        prompt_kwargs = build_prompt_kwargs(
+            load_prompt_tensors(
+                prompt=args.prompt,
+                negative_prompt=args.negative_prompt,
+                checkpoint_path=args.checkpoint,
+                dtype=dtype,
+                device=device,
+                use_prompt_cache=args.use_prompt_cache,
+                max_sequence_length=args.max_sequence_length,
+                cache_dir_for_t5=args.cache_dir,
+                require_negative=True,
+            ),
+            max_sequence_length=args.max_sequence_length,
         )
-
-    del video_mask, video_mask2, video_new_bg
-    clear_memory()
-
-    noise = x.sample
-    del x
-    foreground = foreground.sample
-    z_mask = z_mask.sample
-    z_mask2 = z_mask2.sample
-
-    # Binarize masks (non-optimized's clean approach)
-    video_mask_bin = (z_mask.detach().cpu().float() > 0).to(device=device, dtype=video_bg.dtype)
-    video_mask2_bin = (z_mask2.detach().cpu().float() > 0).to(device=device, dtype=video_bg.dtype)
-    del z_mask, z_mask2, video_bg
-    clear_memory()
-
-    # --- 4) Extract foreground with pixel injection ---
-    foreground = foreground * (1 - video_mask_bin) + video_p * video_mask_bin
-    foreground = foreground * video_mask2_bin
-
-    out_foreground = tensor_video_to_pil_images(
-        (pipe.video_processor.postprocess_video(foreground, output_type="pt")[0] * 255)
-        .long()
-        .permute(0, 2, 3, 1)
-    )
-    export_to_video(out_foreground, os.path.join(args.out_dir, f"{video_folder}_foreground.mp4"), fps=24)
-    print(f"Saved foreground: {args.out_dir}/{video_folder}_foreground.mp4")
-    del out_foreground, foreground
-    clear_memory()
-
-    # --- 5) Latent addition to new background ---
-    noise = noise * (1 - video_mask_bin) + video_p * video_mask_bin
-    del video_mask_bin, video_mask2_bin, video_p
-    clear_memory()
-
-    out_latent_add = tensor_video_to_pil_images(
-        (pipe.video_processor.postprocess_video(noise, output_type="pt")[0] * 255)
-        .long()
-        .permute(0, 2, 3, 1)
-    )
-    export_to_video(out_latent_add, os.path.join(args.out_dir, f"{video_folder}_latent_addition.mp4"), fps=24)
-    print(f"Saved latent addition: {args.out_dir}/{video_folder}_latent_addition.mp4")
-    del out_latent_add
-
-    # --- 6) Optional refinement ---
-    if args.skip_refinement:
-        print("Skipping refinement step.")
-    else:
-        condition_latents = retrieve_latents(pipe.vae.encode(noise), generator=None)
-        del noise
-        condition_latents = pipe._normalize_latents(condition_latents, pipe.vae.latents_mean, pipe.vae.latents_std)
-        condition_latents = condition_latents.to(device=device, dtype=dtype)
         clear_memory()
 
-        prompt_kwargs = _load_or_build_prompt_embeds(
-            prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
-            checkpoint=args.checkpoint,
-            dtype=dtype,
+    foreground_assembler = WindowedFrameAssembler(merge_mode="blend")
+    latent_add_assembler = WindowedFrameAssembler(merge_mode="blend")
+    refined_assembler = WindowedFrameAssembler(merge_mode="blend") if not args.skip_refinement else None
+
+    for window_index, window in enumerate(windows, start=1):
+        print(f"Window {window_index}/{len(windows)}: frames {window.start}:{window.end}")
+
+        video_p, source_frame_count = _load_windowed_video_tensor(
+            pipe,
+            source_video_path,
+            window,
+            target_length=plan.window_frames,
+            width=plan.width,
+            height=plan.height,
             device=device,
-            use_prompt_cache=args.use_prompt_cache,
-            max_sequence_length=args.max_sequence_length,
-            cache_dir_for_t5=args.cache_dir,
+        )
+        video_bg, _ = _load_windowed_video_tensor(
+            pipe,
+            clean_bg_path,
+            window,
+            target_length=plan.window_frames,
+            width=plan.width,
+            height=plan.height,
+            device=device,
+        )
+        video_mask, _ = _load_windowed_video_tensor(
+            pipe,
+            object_mask_path,
+            window,
+            target_length=plan.window_frames,
+            width=plan.width,
+            height=plan.height,
+            device=device,
+        )
+        video_mask2, _ = _load_windowed_video_tensor(
+            pipe,
+            total_mask_path,
+            window,
+            target_length=plan.window_frames,
+            width=plan.width,
+            height=plan.height,
+            device=device,
+        )
+        video_new_bg, _ = _load_windowed_video_tensor(
+            pipe,
+            new_bg_path,
+            window,
+            target_length=plan.window_frames,
+            width=plan.width,
+            height=plan.height,
+            device=device,
         )
 
-        generator = get_generator(args.seed, device=device)
+        temb = torch.tensor(0.0, device=device, dtype=torch.float32)
 
-        with MemoryTracker("Refinement"):
-            refined = pipe(
-                width=w,
-                height=h,
-                num_frames=nframes,
-                denoise_strength=0.3,
-                num_inference_steps=10,
-                latents=condition_latents,
-                decode_timestep=0.05,
-                image_cond_noise_scale=0.025,
-                generator=generator,
-                output_type="pil",
-                **prompt_kwargs,
-            ).frames[0]
+        with MemoryTracker(f"VAE Encoding/Decoding window {window_index}"):
+            x, foreground, z_mask, z_mask2 = pipe.vae(
+                [video_p, video_bg, video_mask, video_mask2, video_new_bg],
+                temb=temb,
+            )
 
-        export_to_video(refined, os.path.join(args.out_dir, f"{video_folder}_refined.mp4"), fps=24)
-        print(f"Saved refined: {args.out_dir}/{video_folder}_refined.mp4")
+        noise = x.sample
+        foreground = foreground.sample
+        z_mask = z_mask.sample
+        z_mask2 = z_mask2.sample
+        del x
+
+        video_mask_bin = (z_mask.detach().cpu().float() > 0).to(device=device, dtype=video_bg.dtype)
+        video_mask2_bin = (z_mask2.detach().cpu().float() > 0).to(device=device, dtype=video_bg.dtype)
+        del z_mask, z_mask2, video_bg, video_mask, video_mask2, video_new_bg
+        clear_memory()
+
+        foreground = foreground * (1 - video_mask_bin) + video_p * video_mask_bin
+        foreground = foreground * video_mask2_bin
+        foreground_frames = tensor_video_to_pil_images(
+            (pipe.video_processor.postprocess_video(foreground, output_type="pt")[0] * 255)
+            .long()
+            .permute(0, 2, 3, 1)
+        )[:source_frame_count]
+        foreground_assembler.add_window(window, foreground_frames)
+        del foreground_frames, foreground
+        clear_memory()
+
+        noise = noise * (1 - video_mask_bin) + video_p * video_mask_bin
+        del video_mask_bin, video_mask2_bin, video_p
+        clear_memory()
+
+        latent_add_frames = tensor_video_to_pil_images(
+            (pipe.video_processor.postprocess_video(noise, output_type="pt")[0] * 255)
+            .long()
+            .permute(0, 2, 3, 1)
+        )[:source_frame_count]
+        latent_add_assembler.add_window(window, latent_add_frames)
+        del latent_add_frames
+        clear_memory()
+
+        if refined_assembler is not None and prompt_kwargs is not None:
+            condition_latents = retrieve_latents(pipe.vae.encode(noise), generator=None)
+            condition_latents = pipe._normalize_latents(condition_latents, pipe.vae.latents_mean, pipe.vae.latents_std)
+            condition_latents = condition_latents.to(device=device, dtype=dtype)
+            del noise
+            clear_memory()
+
+            generator = get_generator(args.seed + window.start, device=device)
+            with MemoryTracker(f"Refinement window {window_index}"):
+                refined_frames = pipe.my_call(
+                    width=plan.width,
+                    height=plan.height,
+                    num_frames=plan.window_frames,
+                    denoise_strength=0.3,
+                    num_inference_steps=10,
+                    latents=condition_latents,
+                    decode_timestep=0.05,
+                    image_cond_noise_scale=0.025,
+                    generator=generator,
+                    output_type="pil",
+                    unload_transformer_after_generation=False,
+                    **prompt_kwargs,
+                ).frames[0][:source_frame_count]
+
+            refined_assembler.add_window(window, refined_frames)
+            del condition_latents, refined_frames
+            clear_memory()
+        else:
+            del noise
+            clear_memory()
+
+    video_folder_name = os.path.basename(video_folder)
+    foreground_path = os.path.join(args.out_dir, f"{video_folder_name}_foreground.mp4")
+    latent_add_path = os.path.join(args.out_dir, f"{video_folder_name}_latent_addition.mp4")
+    export_to_video(foreground_assembler.finalize(), foreground_path, fps=max(1, int(round(plan.fps or 24))))
+    export_to_video(latent_add_assembler.finalize(), latent_add_path, fps=max(1, int(round(plan.fps or 24))))
+    print(f"Saved foreground: {foreground_path}")
+    print(f"Saved latent addition: {latent_add_path}")
+
+    if refined_assembler is None:
+        print("Skipping refinement step.")
+    else:
+        refined_path = os.path.join(args.out_dir, f"{video_folder_name}_refined.mp4")
+        export_to_video(refined_assembler.finalize(), refined_path, fps=max(1, int(round(plan.fps or 24))))
+        print(f"Saved refined: {refined_path}")
 
     print_memory_stats()
 
