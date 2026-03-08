@@ -110,8 +110,9 @@ Output is saved to `results/<video_name>.mp4`.
 |------|-------------|
 | `--video` | Folder name under `example_videos/` |
 | `--checkpoint` | Path to model checkpoint (default: `model_checkpoint/ltx-video-2b-v0.9.5.safetensors`) |
-| `--height`, `--width` | Output resolution (default: 480x704) |
-| `--num_frames` | Frame count (default: 97 = ~4s at 24fps) |
+| `--height`, `--width` | Output resolution (`auto` by default; preserves aspect ratio within the memory budget) |
+| `--num_frames` | Optional cap on total frames to process |
+| `--window_frames` | Frames per generation window (auto by default) |
 | `--use_prompt_cache` | Cache T5 embeddings to `cached_embeddings/` |
 | `--num_inference_steps` | Quality/speed tradeoff (default: 30) |
 
@@ -132,7 +133,8 @@ python self_attention_map.py \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--video_folder` | (required) | Folder with `video.mp4` and `object_mask.mp4` |
-| `--height`, `--width` | 480, 704 | Processing resolution |
+| `--height`, `--width` | auto | Processing resolution, chosen from the input video and memory budget unless overridden |
+| `--window_frames` | auto | Frames per attention-extraction window |
 | `--threshold` | adaptive | Attention threshold (`None` = mean + 0.5*std) |
 | `--dilation` | 3 | Morphological dilation kernel size |
 | `--max_layers` | 4 | Number of attention layers to sample (fewer = less memory) |
@@ -175,7 +177,13 @@ results/
 
 ## Memory Configuration
 
-The default configuration targets Apple Silicon with 24 GB unified memory:
+The runtime is still tuned for Apple Silicon with 24 GB unified memory, but the scripts no longer hard-stop at one fixed clip size. They now:
+
+- auto-fit resolution to the input aspect ratio and memory budget
+- split longer clips into overlapping windows and stitch the outputs back together
+- pad very short clips to VAE-compatible lengths and trim them back after inference
+
+The reference budget is still based on these settings:
 
 | Setting | Value |
 |---------|-------|

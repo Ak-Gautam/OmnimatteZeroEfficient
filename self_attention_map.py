@@ -30,6 +30,17 @@ from memory_utils import (
     apply_memory_optimizations,
     round_frames_to_vae_compatible,
 )
+from runtime_utils import (
+    DEFAULT_INPUT_DIR,
+    WindowedFrameAssembler,
+    inspect_video,
+    load_prompt_tensors,
+    load_video_frames,
+    pad_frames_to_length,
+    plan_processing,
+    plan_temporal_windows,
+    resolve_video_folder,
+)
 
 
 class AttentionMapExtractor:
@@ -554,32 +565,37 @@ class SelfAttentionMapExtraction:
         return effects_mask_binary
 
     @torch.no_grad()
-    def generate_total_mask(self, video_path: str, object_mask_path: str, output_path: str,
-                            height: int = 512, width: int = 768,
-                            threshold: Optional[float] = None, dilation_size: int = 3,
-                            fps: int = 24) -> torch.Tensor:
+    def generate_total_mask_frames(
+        self,
+        video,
+        object_mask,
+        height: int = 512,
+        width: int = 768,
+        threshold: Optional[float] = None,
+        dilation_size: int = 3,
+    ) -> List[Image.Image]:
         """
-        Generate total_mask.mp4 combining object_mask with attention-based effects.
+        Generate total-mask frames by combining object_mask with attention-based effects.
 
         Args:
-            video_path: Path to input video
-            object_mask_path: Path to object mask video
-            output_path: Path to save total mask video
+            video: Input video path or list of frames
+            object_mask: Object-mask path or list of frames
             height, width: Processing resolution
             threshold: Threshold for effects mask (None = adaptive)
             dilation_size: Dilation kernel size for smoothing
-            fps: Output video frame rate
 
         Returns:
-            Total mask tensor (B, 1, T, H, W)
+            Total-mask frames as RGB PIL images.
         """
         device = self.pipeline._execution_device
         dtype = self.pipeline.transformer.dtype
 
-        print(f"Loading video from {video_path}")
-        video = load_video(video_path)
-        print(f"Loading object mask from {object_mask_path}")
-        object_mask = load_video(object_mask_path)
+        if isinstance(video, str):
+            print(f"Loading video from {video}")
+            video = load_video(video)
+        if isinstance(object_mask, str):
+            print(f"Loading object mask from {object_mask}")
+            object_mask = load_video(object_mask)
 
         video_tensor = self.pipeline.video_processor.preprocess_video(video, height, width)
         video_tensor = video_tensor.to(device=device, dtype=dtype)
@@ -634,21 +650,38 @@ class SelfAttentionMapExtraction:
             frame = total_mask_rgb[0, :, t].permute(1, 2, 0).cpu().numpy()
             frames.append(Image.fromarray(frame))
 
+        return frames
+
+    @torch.no_grad()
+    def generate_total_mask(self, video_path: str, object_mask_path: str, output_path: str,
+                            height: int = 512, width: int = 768,
+                            threshold: Optional[float] = None, dilation_size: int = 3,
+                            fps: int = 24) -> List[Image.Image]:
+        frames = self.generate_total_mask_frames(
+            video_path,
+            object_mask_path,
+            height=height,
+            width=width,
+            threshold=threshold,
+            dilation_size=dilation_size,
+        )
         print(f"Saving total mask to {output_path}")
         export_to_video(frames, output_path, fps=fps)
-
-        return total_mask
+        return frames
 
 
 def generate_total_mask_for_folder(
     pipeline,
     folder_path: str,
     output_folder: Optional[str] = None,
-    height: int = 512,
-    width: int = 768,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
     threshold: Optional[float] = None,
     dilation_size: int = 3,
     max_layers: int = 4,
+    num_frames: Optional[int] = None,
+    window_frames: Optional[int] = None,
+    overlap_frames: Optional[int] = None,
     prompt_embeds: Optional[torch.Tensor] = None,
     prompt_attention_mask: Optional[torch.Tensor] = None,
 ):
@@ -683,6 +716,27 @@ def generate_total_mask_for_folder(
         print(f"Object mask not found in {folder_path}")
         return None
 
+    video_info = inspect_video(video_path)
+    available_frames = min(video_info.frame_count, inspect_video(object_mask_path).frame_count)
+    requested_total_frames = available_frames if num_frames is None else min(available_frames, num_frames)
+    plan = plan_processing(
+        video_info,
+        requested_width=width,
+        requested_height=height,
+        requested_total_frames=requested_total_frames,
+        requested_window_frames=window_frames,
+        requested_overlap_frames=overlap_frames,
+        requested_num_inference_steps=1,
+    )
+    windows = plan_temporal_windows(plan.total_frames, plan.window_frames, plan.overlap_frames)
+
+    print(
+        f"Processing {plan.total_frames} frames at {plan.width}x{plan.height} "
+        f"with {len(windows)} window(s) of up to {plan.window_frames} frames"
+    )
+    for warning in plan.warnings:
+        print(f"Note: {warning}")
+
     extractor = SelfAttentionMapExtraction(
         pipeline,
         extraction_timestep=0.5,
@@ -693,10 +747,27 @@ def generate_total_mask_for_folder(
     extractor.setup_extractor()
 
     try:
-        total_mask = extractor.generate_total_mask(
-            video_path, object_mask_path, output_path,
-            height=height, width=width, threshold=threshold, dilation_size=dilation_size)
-        return total_mask
+        assembler = WindowedFrameAssembler(merge_mode="max")
+        for window_index, window in enumerate(windows, start=1):
+            print(f"Window {window_index}/{len(windows)}: frames {window.start}:{window.end}")
+            video_frames = load_video_frames(video_path, start=window.start, end=window.end)
+            object_mask_frames = load_video_frames(object_mask_path, start=window.start, end=window.end)
+            video_frames = pad_frames_to_length(video_frames, plan.window_frames)
+            object_mask_frames = pad_frames_to_length(object_mask_frames, plan.window_frames)
+            mask_frames = extractor.generate_total_mask_frames(
+                video_frames,
+                object_mask_frames,
+                height=plan.height,
+                width=plan.width,
+                threshold=threshold,
+                dilation_size=dilation_size,
+            )[:window.length]
+            assembler.add_window(window, mask_frames)
+            clear_memory()
+
+        export_to_video(assembler.finalize(), output_path, fps=max(1, int(round(plan.fps or 24))))
+        print(f"Saved total mask to {output_path}")
+        return output_path
     finally:
         extractor.cleanup()
 
@@ -706,12 +777,19 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Generate total_mask.mp4 from video and object_mask using self-attention")
+    parser.add_argument("--base_dir", type=str, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--video_folder", type=str, required=True,
                         help="Folder containing video.mp4 and object_mask.mp4")
-    parser.add_argument("--height", type=int, default=480,
-                        help="Processing height (default: 480)")
-    parser.add_argument("--width", type=int, default=704,
-                        help="Processing width (default: 704)")
+    parser.add_argument("--height", type=int, default=None,
+                        help="Processing height (default: auto-fit input)")
+    parser.add_argument("--width", type=int, default=None,
+                        help="Processing width (default: auto-fit input)")
+    parser.add_argument("--num_frames", type=int, default=None,
+                        help="Optional cap on total frames to process")
+    parser.add_argument("--window_frames", type=int, default=None,
+                        help="Frames per attention-extraction window")
+    parser.add_argument("--overlap_frames", type=int, default=None,
+                        help="Overlap between attention-extraction windows")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Threshold for effects mask (default: adaptive)")
     parser.add_argument("--dilation", type=int, default=3,
@@ -729,69 +807,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     from device_utils import DEFAULT_CHECKPOINT, load_pipeline
-    from prompt_cache import (
-        build_prompt_cache_key,
-        encode_prompts_with_t5_only,
-        find_legacy_prompt_cache,
-        get_prompt_cache_path,
-        load_prompt_cache,
-        move_prompt_cache_to_device,
-        normalize_cached_prompt_tensors,
-        save_prompt_cache,
-    )
-
     device = get_device()
     dtype = get_optimal_dtype()
     checkpoint = args.checkpoint or DEFAULT_CHECKPOINT
 
-    # --- 1) Build/load prompt embeddings (before loading video model) ---
-    prompt_embeds = None
-    prompt_attention_mask = None
-
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    cache_dir = os.path.join(project_root, "cached_embeddings")
-    cache_key = build_prompt_cache_key(
+    prompt_tensors = load_prompt_tensors(
         prompt=args.prompt,
         negative_prompt=None,
         checkpoint_path=checkpoint,
-        max_sequence_length=256,
-        num_videos_per_prompt=1,
         dtype=dtype,
+        device=device,
+        use_prompt_cache=args.use_prompt_cache,
+        max_sequence_length=256,
+        cache_dir_for_t5=args.cache_dir,
+        require_negative=False,
     )
-    cache_path = get_prompt_cache_path(cache_dir, cache_key)
-
-    cached = None
-    if args.use_prompt_cache:
-        if os.path.exists(cache_path):
-            cached = load_prompt_cache(cache_path)
-            print(f"Loaded prompt cache: {os.path.basename(cache_path)}")
-        else:
-            legacy_path = find_legacy_prompt_cache(cache_dir, args.prompt)
-            if legacy_path is not None:
-                cached = load_prompt_cache(legacy_path)
-                print(f"Using legacy cache: {os.path.basename(legacy_path)}")
-
-    if cached is None:
-        print("Prompt cache miss; loading T5 encoder only to compute embeddings...")
-        cached = encode_prompts_with_t5_only(
-            prompt=args.prompt,
-            negative_prompt=None,
-            max_sequence_length=256,
-            num_videos_per_prompt=1,
-            dtype=dtype,
-            cache_dir=args.cache_dir,
-            device=device,
-            do_classifier_free_guidance=False,
-        )
-        if args.use_prompt_cache:
-            save_prompt_cache(cache_path, cached)
-            print(f"Saved prompt cache: {os.path.basename(cache_path)}")
-        clear_memory()
-
-    cached = normalize_cached_prompt_tensors(cached, require_negative=False)
-    moved = move_prompt_cache_to_device(cached, device=device, dtype=dtype)
-    prompt_embeds = moved.get("prompt_embeds")
-    prompt_attention_mask = moved.get("prompt_attention_mask")
+    prompt_embeds = prompt_tensors.get("prompt_embeds")
+    prompt_attention_mask = prompt_tensors.get("prompt_attention_mask")
 
     # --- 2) Load pipeline (skip T5 since we have cached embeddings) ---
     print("Loading pipeline...")
@@ -810,14 +842,18 @@ if __name__ == "__main__":
         raise RuntimeError("Prompt embeddings are missing before video model run.")
 
     # --- 3) Extract attention and generate total mask ---
+    video_folder = resolve_video_folder(args.base_dir, args.video_folder)
     generate_total_mask_for_folder(
         pipe,
-        args.video_folder,
+        video_folder,
         height=args.height,
         width=args.width,
         threshold=args.threshold,
         dilation_size=args.dilation,
         max_layers=args.max_layers,
+        num_frames=args.num_frames,
+        window_frames=args.window_frames,
+        overlap_frames=args.overlap_frames,
         prompt_embeds=prompt_embeds,
         prompt_attention_mask=prompt_attention_mask,
     )
