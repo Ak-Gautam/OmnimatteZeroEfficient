@@ -9,6 +9,6 @@ accelerate>=1.1.1
 tqdm
 imageio
 imageio-ffmpeg
-numpy==1.24.4
+numpy>=1.24.4,<3
 sentencepiece
 protobuf

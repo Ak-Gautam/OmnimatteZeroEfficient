@@ -1,17 +1,50 @@
+# Environments
 playenv/
+playenv-py312-backup/
+venv/
+.env
+
+# Data and Outputs
 results/
-logs/
-*.log
+media_assets/
+cached_embeddings/
+.locks/
+*.mp4
 *.csv
 *.json
+
+# Model Files
+model_checkpoints/
+models--*
 *.h5
 *.ckpt
 *.pt
-*.pyc
-.DS_Store
-__pycache__/
-model_checkpoints/
 *.safetensors
-*.mp4
-media_assets/
-/models--Lightricks--LTX-Video
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS Specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Development
+.vscode/
+.idea/
+*.swp
+*.swo
