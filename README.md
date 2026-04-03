@@ -53,13 +53,15 @@ All three pipeline stages work on Apple Silicon: object removal, self-attention 
 - Apple Silicon Mac with 24 GB unified memory (M4 Pro, M4 Max, M3 Pro, M3 Max, etc.)
 - ~6 GB disk space for the LTX-Video 2B model checkpoint
 
+For macOS 26 on Apple Silicon, use a Python 3.14 virtualenv and install PyTorch from the default PyPI index. The Python 3.12 wheels can report `mps` as unavailable on this OS even on supported hardware.
+
 ## Installation
 
 ```bash
 git clone https://github.com/Ak-Gautam/OmnimatteZeroEfficient.git
 cd OmnimatteZeroEfficient
 
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 
 pip install -r requirements.txt

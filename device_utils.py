@@ -7,6 +7,8 @@ and pipeline loading from local checkpoints.
 import os
 import torch
 import gc
+import platform
+import sys
 from typing import Optional
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +21,25 @@ def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def get_mps_unavailable_reason() -> Optional[str]:
+    """Return a concise reason when Apple GPU is expected but unavailable."""
+    if torch.backends.mps.is_available() or not torch.backends.mps.is_built():
+        return None
+
+    if platform.machine() != "arm64":
+        return "PyTorch was built with MPS support, but this interpreter is not running arm64."
+
+    macos_version = platform.mac_ver()[0] or "unknown"
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if macos_version.startswith("26.") and sys.version_info[:2] == (3, 12):
+        return (
+            "PyTorch MPS is unavailable in this Python 3.12 environment on macOS 26. "
+            "Use a Python 3.14 venv with PyPI torch/torchvision/torchaudio wheels."
+        )
+
+    return "PyTorch was built with MPS support, but Metal is not available in this environment."
 
 
 def get_device_type() -> str:
@@ -148,6 +169,10 @@ def print_device_info():
     if is_mps():
         print(f"Note: Using unified memory (shared between CPU/GPU/OS)")
         print(f"Effective available for ML: ~{total_mem * 0.65:.0f}-{total_mem * 0.75:.0f} GB")
+    else:
+        reason = get_mps_unavailable_reason()
+        if reason is not None:
+            print(f"MPS unavailable: {reason}")
 
 
 class MemoryTracker:

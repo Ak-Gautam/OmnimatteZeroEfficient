@@ -394,14 +394,21 @@ class SelfAttentionMapExtraction:
     def _encode_video(self, video: torch.Tensor,
                       generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """Encode video to latent space."""
-        latents = retrieve_latents(self.pipeline.vae.encode(video), generator=generator)
+        # VAE is forced to float32 for MPS numerical stability, so cast input
+        # to match, then bring latents back to the transformer's dtype.
+        vae_dtype = self.pipeline.vae.dtype
+        video_for_vae = video.to(dtype=vae_dtype)
+        latents = retrieve_latents(self.pipeline.vae.encode(video_for_vae), generator=generator)
+        del video_for_vae
         latents = self.pipeline._normalize_latents(
             latents, self.pipeline.vae.latents_mean, self.pipeline.vae.latents_std)
-        return latents
+        return latents.to(dtype=self.pipeline.transformer.dtype)
 
     @torch.no_grad()
     def extract_effects_mask(self, video, object_mask, height: int = 512, width: int = 768,
                              threshold: Optional[float] = None, dilation_size: int = 3,
+                             temporal_radius: int = 0, temporal_dilation: int = 0,
+                             support_dilation_size: int = 65,
                              generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """
         Extract effects mask (shadows, reflections) using self-attention.
@@ -415,6 +422,9 @@ class SelfAttentionMapExtraction:
             height, width: Processing resolution
             threshold: Threshold for binarizing attention map (None = adaptive)
             dilation_size: Kernel size for morphological dilation (default: 3)
+            temporal_radius: Number of latent frames around each query frame to consider
+            temporal_dilation: Number of pixel frames to dilate object presence over time
+            support_dilation_size: Kernel size for limiting effects to the object's neighborhood
             generator: Random generator for reproducibility
 
         Returns:
@@ -476,6 +486,8 @@ class SelfAttentionMapExtraction:
 
         mask_latent_all = torch.stack(mask_latent_frames, dim=2)
 
+        object_present_latent = mask_latent_all.amax(dim=(1, 3, 4)) > 0
+
         # Compute per-frame spatial attention to object
         per_frame_effects = []
 
@@ -499,9 +511,13 @@ class SelfAttentionMapExtraction:
                 # Extract attention FROM frame_t TO all frames
                 attn_from_frame_t = attn_reshaped[:, frame_t, :, :, :]
 
-                # Sum attention to object regions across all frames
+                # Restrict attention aggregation to temporally local object frames.
                 frame_attention_to_obj = torch.zeros(B, spatial_size, device=device, dtype=dtype)
-                for src_t in range(num_latent_frames):
+                src_start = max(0, frame_t - temporal_radius)
+                src_end = min(num_latent_frames, frame_t + temporal_radius + 1)
+                for src_t in range(src_start, src_end):
+                    if not object_present_latent[:, src_t].any():
+                        continue
                     src_mask = mask_latent_all[:, 0, src_t, :, :].view(B, -1).to(device)
                     attn_to_obj = (attn_from_frame_t[:, :, src_t, :] * src_mask.unsqueeze(1)).sum(dim=-1)
                     frame_attention_to_obj += attn_to_obj
@@ -517,7 +533,8 @@ class SelfAttentionMapExtraction:
 
             del frame_effects_sum
 
-        del attention_maps, mask_latent_all, mask_binary
+        object_presence = mask_binary.amax(dim=(3, 4), keepdim=True)
+        del attention_maps, mask_latent_all, object_present_latent
         clear_memory()
 
         # Stack and process
@@ -541,15 +558,38 @@ class SelfAttentionMapExtraction:
         del effects_spatial
 
         effects_mask = effects_temporal.unsqueeze(1)
+        effects_mask = effects_mask * (1 - mask_binary)
+
+        object_support = mask_binary
+        if support_dilation_size > 1:
+            support_radius = support_dilation_size // 2
+            object_support = F.max_pool2d(
+                mask_binary.permute(0, 2, 1, 3, 4).reshape(B * T, 1, H, W),
+                kernel_size=support_dilation_size,
+                stride=1,
+                padding=support_radius,
+            ).reshape(B, T, 1, H, W).permute(0, 2, 1, 3, 4)
+
+        if temporal_dilation > 0:
+            temporal_kernel = torch.ones(1, 1, temporal_dilation * 2 + 1, device=device)
+            presence_1d = object_presence.squeeze(-1).squeeze(-1).float()
+            dilated_presence = F.conv1d(presence_1d, temporal_kernel, padding=temporal_dilation)
+            object_presence = (dilated_presence > 0).unsqueeze(-1).unsqueeze(-1).float()
+
+        effects_mask = effects_mask * object_support
+        effects_mask = effects_mask * object_presence
 
         # Adaptive thresholding if not specified
         if threshold is None:
-            flat_effects = effects_mask.view(-1)
-            threshold = float(flat_effects.mean() + 0.5 * flat_effects.std())
+            support = (object_presence > 0) & (object_support > 0)
+            flat_effects = effects_mask.masked_select(support)
+            if flat_effects.numel() == 0:
+                return torch.zeros_like(effects_mask)
+            threshold = float(flat_effects.mean() + flat_effects.std())
             print(f"Using adaptive threshold: {threshold:.4f}")
 
         effects_mask_binary = (effects_mask > threshold).float()
-        del effects_mask
+        del effects_mask, object_presence, object_support, mask_binary
 
         # Apply dilation to smooth edges
         if dilation_size > 0:
@@ -573,6 +613,9 @@ class SelfAttentionMapExtraction:
         width: int = 768,
         threshold: Optional[float] = None,
         dilation_size: int = 3,
+        temporal_radius: int = 0,
+        temporal_dilation: int = 0,
+        support_dilation_size: int = 65,
     ) -> List[Image.Image]:
         """
         Generate total-mask frames by combining object_mask with attention-based effects.
@@ -583,6 +626,9 @@ class SelfAttentionMapExtraction:
             height, width: Processing resolution
             threshold: Threshold for effects mask (None = adaptive)
             dilation_size: Dilation kernel size for smoothing
+            temporal_radius: Number of latent frames around each query frame to consider
+            temporal_dilation: Number of pixel frames to dilate object presence over time
+            support_dilation_size: Kernel size for limiting effects to the object's neighborhood
 
         Returns:
             Total-mask frames as RGB PIL images.
@@ -625,7 +671,12 @@ class SelfAttentionMapExtraction:
         with MemoryTracker("Attention Extraction"):
             effects_mask = self.extract_effects_mask(
                 video_tensor, object_mask_binary, height=H, width=W,
-                threshold=threshold, dilation_size=dilation_size)
+                threshold=threshold,
+                dilation_size=dilation_size,
+                temporal_radius=temporal_radius,
+                temporal_dilation=temporal_dilation,
+                support_dilation_size=support_dilation_size,
+            )
 
         del video_tensor
         clear_memory()
@@ -656,6 +707,8 @@ class SelfAttentionMapExtraction:
     def generate_total_mask(self, video_path: str, object_mask_path: str, output_path: str,
                             height: int = 512, width: int = 768,
                             threshold: Optional[float] = None, dilation_size: int = 3,
+                            temporal_radius: int = 0, temporal_dilation: int = 0,
+                            support_dilation_size: int = 65,
                             fps: int = 24) -> List[Image.Image]:
         frames = self.generate_total_mask_frames(
             video_path,
@@ -664,6 +717,9 @@ class SelfAttentionMapExtraction:
             width=width,
             threshold=threshold,
             dilation_size=dilation_size,
+            temporal_radius=temporal_radius,
+            temporal_dilation=temporal_dilation,
+            support_dilation_size=support_dilation_size,
         )
         print(f"Saving total mask to {output_path}")
         export_to_video(frames, output_path, fps=fps)
@@ -678,6 +734,9 @@ def generate_total_mask_for_folder(
     width: Optional[int] = None,
     threshold: Optional[float] = None,
     dilation_size: int = 3,
+    temporal_radius: int = 0,
+    temporal_dilation: int = 0,
+    support_dilation_size: int = 65,
     max_layers: int = 4,
     num_frames: Optional[int] = None,
     window_frames: Optional[int] = None,
@@ -695,6 +754,9 @@ def generate_total_mask_for_folder(
         height, width: Processing resolution
         threshold: Threshold for effects mask (None = adaptive)
         dilation_size: Dilation kernel size for smoothing
+        temporal_radius: Number of latent frames around each query frame to consider
+        temporal_dilation: Number of pixel frames to dilate object presence over time
+        support_dilation_size: Kernel size for limiting effects to the object's neighborhood
         max_layers: Maximum attention layers to sample
         prompt_embeds: Pre-computed prompt embeddings (optional)
         prompt_attention_mask: Pre-computed attention mask (optional)
@@ -761,6 +823,9 @@ def generate_total_mask_for_folder(
                 width=plan.width,
                 threshold=threshold,
                 dilation_size=dilation_size,
+                temporal_radius=temporal_radius,
+                temporal_dilation=temporal_dilation,
+                support_dilation_size=support_dilation_size,
             )[:window.length]
             assembler.add_window(window, mask_frames)
             clear_memory()
@@ -794,6 +859,12 @@ if __name__ == "__main__":
                         help="Threshold for effects mask (default: adaptive)")
     parser.add_argument("--dilation", type=int, default=3,
                         help="Dilation size for smoothing edges (default: 3)")
+    parser.add_argument("--temporal_radius", type=int, default=0,
+                        help="Latent-frame radius for aggregating attention (default: 0 = same latent frame)")
+    parser.add_argument("--temporal_dilation", type=int, default=0,
+                        help="Pixel-frame dilation for object presence gating (default: 0)")
+    parser.add_argument("--support_dilation", type=int, default=65,
+                        help="Spatial dilation size for limiting effects to the object's neighborhood (default: 65)")
     parser.add_argument("--max_layers", type=int, default=4,
                         help="Maximum attention layers to use (fewer = less memory)")
     parser.add_argument("--cache_dir", type=str, default="",
@@ -850,6 +921,9 @@ if __name__ == "__main__":
         width=args.width,
         threshold=args.threshold,
         dilation_size=args.dilation,
+        temporal_radius=args.temporal_radius,
+        temporal_dilation=args.temporal_dilation,
+        support_dilation_size=args.support_dilation,
         max_layers=args.max_layers,
         num_frames=args.num_frames,
         window_frames=args.window_frames,
